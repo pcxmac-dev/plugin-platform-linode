@@ -314,3 +314,15 @@ def test_the_command_line_reads_and_asks_yes_before_a_change(made, env):
     assert cli.main(["ddns"], plugin=p, out=said.append, err=told.append, ask=lambda q: "no") == 1
     assert told[-1] == "nothing done" and len(fake.writes()) == writes  # a pass may write: asked first
     assert cli.main(["ddns", "--yes"], plugin=p, out=said.append) == 0 and fake.writes()[-1][0] == "POST"
+
+
+def test_the_platforms_one_shot_command_starts_nothing(made):
+    """The platform's status and machine commands attach it to answer and end (PlatformApp.once, liminal-platform
+    0.20.1): nothing of it runs on its own then."""
+    p, fake = made()
+    p.attach(type("Once", (), {"NAME": "platform", "once": True})(), Pairs(settings_of(ddns="lab.example.com")))
+    try:
+        time.sleep(0.1)
+        assert not p.working and fake.requests == []
+    finally:
+        p.detach()

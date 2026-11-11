@@ -37,6 +37,8 @@ Needs liminal-libs>=1.49.2.
   every quarter of an hour while attached, and the ask route taking a change without the page, stay the user's and the
   platform's to decide.
 
+The platform's one-shot commands (status, machine: `PlatformApp.once`, liminal-platform 0.20.1) start none of its background work.
+
 ## 0.1.0 (2026-11-11)
 
 The first release (the user: "ALSO i would like to add two new plugins, Digital Ocean and LINODE"; for the cloud

@@ -815,7 +815,7 @@ class LinodePlugin(MachinePlugin):
             self._rt.config = None
 
     def _on_platform(self) -> bool:
-        return getattr(self.app, "NAME", "") == "platform"
+        return getattr(self.app, "NAME", "") == "platform" and not getattr(self.app, "once", False)  # never a one-shot command's
 
     def _start_if_set(self) -> None:
         if self.config().ready:

@@ -8,7 +8,8 @@ asks you to type yes first.
     records DOMAIN                           a domain's records
     firewalls                                the Cloud Firewalls and their rules
     keys                                     the profile's SSH keys
-    ddns [--now]                             a Dynamic DNS pass: a host's record set where it differs (--now: every host)
+    ddns [--now]                             a Dynamic DNS pass: a host of its own set where it differs (--now: every
+                                             one of its own), asks yes; a host holding another address left as it is
     power LINODE on|off|reboot               a Linode booted, shut down or rebooted (asks yes)
     set DOMAIN HOST TYPE TARGET [--ttl N] [--priority N] [--tag T]
                                              a record set, every other record kept (asks yes)
@@ -42,7 +43,8 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("firewalls", help="the Cloud Firewalls and their rules")
     sub.add_parser("keys", help="the profile's SSH keys")
     d = sub.add_parser("ddns", help="a Dynamic DNS pass")
-    d.add_argument("--now", action="store_true", help="every host's record set, whether it differs or not")
+    d.add_argument("--now", action="store_true", help="every host of its own set, whether it differs or not")
+    d.add_argument("--yes", action="store_true", help="answer yes to the question")
     w = sub.add_parser("power", help="a Linode booted, shut down or rebooted")
     w.add_argument("linode", help="its label or its id")
     w.add_argument("action", choices=sorted(ACTIONS_OF))
@@ -132,6 +134,11 @@ def main(argv: list[str] | None = None, plugin=None, out=None, err=None, ask=Non
             lines = [f"{str(k.get('label') or '–'):<24} {str(k.get('ssh_key') or '').split(' ')[0]:<20} added "
                      f"{str(k.get('created') or '')[:10]}  (id {k.get('id')})" for k in answer] or ["no SSH key in your profile"]
         elif what == "ddns":
+            if not confirmed("A Dynamic DNS pass sets each host of its own to this network's address"
+                             + (", even where it holds it already" if args.now else " where it differs")
+                             + "; a host holding another address is left as it is (Take over… on the platform's page)."):
+                tell("nothing done")
+                return 1
             answer = p.ddns_update(force=args.now)
             lines = [f"{h['host']:<32} {h['address'] or '–':<16} {h['result']} (checked {when(h['checkedAt'])})"
                      for h in answer] or ["no host of LINODE_DDNS_HOSTS is in a master domain of DNS Manager"]

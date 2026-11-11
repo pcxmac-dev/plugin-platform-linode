@@ -165,7 +165,8 @@ class LinodeApi:
         return out
 
     def _write(self, method: str, template: str, body: Mapping | None = None, **ids):
-        """One of FREE_WRITES, and no other request: a change the user confirmed."""
+        """One of FREE_WRITES, and no other request: a change the user confirmed, or Dynamic DNS keeping a host the user
+        listed at this network's address (only what is the keeper's own, or what the user took over on the page)."""
         if (method, template) not in FREE_WRITES:
             raise ValueError(f"{method} {template} is not a change this plugin makes")
         return self.rest.request(method, path_of(template, ids), json=body).data

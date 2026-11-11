@@ -6,8 +6,10 @@ attached (the command line), an EnvironmentLogin of its own. The plugin keeps no
 anywhere, never shown, and only the names of the settings set are said.
 
 The token is a personal access token made in Cloud Manager (your username > API Tokens > Create a Personal Access Token),
-with an access level for each area: the plugin reads every area it shows and changes only Linodes (power), Domains,
-Firewalls and the profile's SSH keys, so the token it needs is Read Only everywhere but those (SCOPES)."""
+with an access level for each area: the plugin reads every area it shows and changes only Linodes (power), Domains and
+Firewalls, so the token it needs is Read Only everywhere but those (SCOPES); the profile's SSH keys are changed here only
+with Account Read/Write, which the plugin asks for nowhere (an audit, 2026-11-11: that scope also reaches the account's
+billing and users). A token holding a space or a line break inside is refused, never sent nor shown."""
 from __future__ import annotations
 
 import hashlib
@@ -30,11 +32,13 @@ WRITE_SCOPES = (
     ("linodes:read_write", "Linodes", "boot, shut down and reboot (and the Linodes, their plans and placement groups read)"),
     ("domains:read_write", "Domains", "records set and removed, Dynamic DNS"),
     ("firewall:read_write", "Firewalls", "Cloud Firewall rules added and removed"),
-    ("account:read_write", "Account", "the profile's SSH keys added and removed (Linode names no scope of the profile's "
-                                      "own for them: Read/Write on Account also lets the token change the account's "
-                                      "contact and billing details; Read Only keeps the keys read only here)"),
 )
+# the profile's SSH keys: Linode names no scope of the profile's own for adding and removing them, and the one it names
+# (account:read_write) also lets a token make payments, add users or cancel the account (an audit, 2026-11-11): so
+# Account is Read Only unless you want the keys added and removed here too
+ACCOUNT_WRITE = "account:read_write"
 READ_SCOPES = (
+    ("account:read_only", "Account"),
     ("volumes:read_only", "Volumes"),
     ("ips:read_only", "IPs"),
     ("images:read_only", "Images"),
@@ -47,10 +51,12 @@ READ_SCOPES = (
 NO_ACCESS = ("events", "longview", "stackscripts")  # areas the plugin never asks: No Access is enough
 SCOPES = tuple(s for s, *_ in WRITE_SCOPES) + tuple(s for s, *_ in READ_SCOPES)
 SCOPE_WORDS = ("Read/Write for " + ", ".join(a for _, a, _ in WRITE_SCOPES) + " ("
-               + " ".join(s for s, *_ in WRITE_SCOPES) + "; Account's for the profile's SSH keys); Read Only for "
+               + " ".join(s for s, *_ in WRITE_SCOPES) + "); Read Only for "
                + ", ".join(a for _, a in READ_SCOPES) + " (" + " ".join(s for s, _ in READ_SCOPES)
-               + "); No Access for the rest")
-ACCESS_SHORT = "Read/Write: " + ", ".join(a for _, a, _ in WRITE_SCOPES) + "; Read Only: the rest it shows"
+               + "); No Access for the rest. Only to add and remove the profile's SSH keys here: Account Read/Write ("
+               + ACCOUNT_WRITE + ", which also lets the token change the account's billing and users)")
+ACCESS_SHORT = ("Read/Write: " + ", ".join(a for _, a, _ in WRITE_SCOPES)
+                + "; Read Only: the rest it shows (Account too, unless SSH keys are changed here)")
 
 # what the login app's "Pairs your plugins ask for" lists, once it lists the platform's plugins
 KEYS = (
@@ -65,6 +71,7 @@ KEYS = (
 )
 NAMES = tuple(k.name for k in KEYS)
 TOKEN_SHAPE = re.compile(r"^[A-Za-z0-9._~+/=-]{20,200}$")  # a bearer token's characters (Linode's are 64 hex digits)
+SPACED = f"{TOKEN} holds a space or a line break inside: it is not sent anywhere; enter it again, alone"
 
 
 @dataclass(frozen=True)
@@ -73,6 +80,7 @@ class Config:
     that never hold a secret)."""
 
     token: str = field(default="", repr=False)
+    token_problem: str = ""  # why a token set is not used (it holds a space or a line break): said instead of "not set"
     hosts: str = ""  # the hosts as typed (split against the account's domains once they are known: ddns.hosts_of)
     minutes: float = MINUTES[2]
     present: frozenset = frozenset()
@@ -115,7 +123,11 @@ def parse(values: Mapping[str, str]) -> Config:
     token = v[TOKEN]
     if token.lower().startswith("bearer "):
         token = token[7:].strip()  # pasted with its header's word
-    if token and not TOKEN_SHAPE.match(token):
+    token_problem = ""
+    if any(c.isspace() for c in token):  # a wrapped paste (setx, a registry edit): never sent, never shown
+        token, token_problem = "", SPACED
+        problems.append(SPACED)
+    elif token and not TOKEN_SHAPE.match(token):
         problems.append(f"{TOKEN} does not look like a personal access token (Linode's are 64 letters and digits): "
                         "it is sent as it is")
     minutes = minutes_of(v[DDNS_MINUTES])
@@ -124,9 +136,10 @@ def parse(values: Mapping[str, str]) -> Config:
             float(v[DDNS_MINUTES])
         except ValueError:
             problems.append(f"{DDNS_MINUTES} is not a number of minutes: {MINUTES[2]:g} is used")
-    if v[DDNS_HOSTS] and not token:
+    if v[DDNS_HOSTS] and not token and not token_problem:
         problems.append(f"{DDNS_HOSTS} is set but {TOKEN} is not: Dynamic DNS sets the hosts through Linode's API with it")
-    return Config(token=token, hosts=v[DDNS_HOSTS], minutes=minutes, present=present, problems=tuple(problems))
+    return Config(token=token, token_problem=token_problem, hosts=v[DDNS_HOSTS], minutes=minutes, present=present,
+                  problems=tuple(problems))
 
 
 def read(login: Login | None = None) -> Config:

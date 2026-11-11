@@ -11,7 +11,7 @@ import re
 import pytest
 
 import plugin_platform_linode as module
-from conftest import HOME, forms_of, page_args, pub, settings_of, table
+from conftest import HOME, FakeLinode, forms_of, page_args, pub, settings_of, table
 from liminal_libs.sources.apis import dead_links, problems
 from liminal_libs.sources.conformance import assert_module_conforms
 from plugin_platform_linode import api, card
@@ -25,7 +25,7 @@ def test_every_plugin_here_conforms_to_the_class_contract():
     assert [p.name for p in found] == ["linode"] and all(p.api == "2.2" and not p.is_record for p in found)
     assert {p.SYSTEM for p in found} == {"platform"} and {p.KIND for p in found} == {"machine"}
     (p,) = found
-    assert (p.title, p.order, p.ICON, p.version, module.__version__) == ("Linode", 761, "linode", "0.1.0", "0.1.0")
+    assert (p.title, p.order, p.ICON, p.version, module.__version__) == ("Linode", 761, "linode", "0.1.1", "0.1.1")
     assert [a.name for a in p.apis] == ["Linode API v4"] and p.interface()["apis"] == ["Linode API v4"]
 
 
@@ -35,11 +35,13 @@ def test_its_settings_are_pairs_named_by_their_variables():
     assert {k.name for k in p.keys if k.secret} == {"LINODE_TOKEN"}
     assert [k.hint.startswith("optional") for k in p.keys] == [False, True, True]
     token = p.keys[0].hint  # where it is made and the access it needs, in Linode's own scopes' areas
-    assert "https://cloud.linode.com/profile/tokens" in token and "Read/Write for Linodes, Domains, Firewalls, Account" in token
-    from plugin_platform_linode.settings import SCOPES
-    assert SCOPES[:4] == ("linodes:read_write", "domains:read_write", "firewall:read_write", "account:read_write")
-    assert all(s.endswith(":read_only") for s in SCOPES[4:]) and all(s in token for s in SCOPES)
-    assert module.MACHINE.status()["why"].endswith("No Access for the rest")  # not set: the page names them too
+    assert "https://cloud.linode.com/profile/tokens" in token and "Read/Write for Linodes, Domains, Firewalls (" in token
+    from plugin_platform_linode.settings import ACCOUNT_WRITE, SCOPE_WORDS, SCOPES
+    assert SCOPES[:3] == ("linodes:read_write", "domains:read_write", "firewall:read_write")
+    assert all(s.endswith(":read_only") for s in SCOPES[3:]) and all(s in token for s in SCOPES)
+    assert "account:read_only" in SCOPES and ACCOUNT_WRITE not in SCOPES  # the account's write: an opt-in for SSH keys alone
+    assert f"Only to add and remove the profile's SSH keys here: Account Read/Write ({ACCOUNT_WRITE}" in token
+    assert module.MACHINE.status()["why"].endswith(SCOPE_WORDS)  # not set: the page names them too
 
 
 def test_its_api_card_is_sound_and_covers_the_whole_reference():
@@ -82,9 +84,12 @@ def test_every_request_a_full_run_makes_is_one_the_card_names(made, env):
     """A refresh, every form's change, a Dynamic DNS pass: each request the stand-in saw is a call the card names as used,
     and every call the card names as used was made."""
     env(settings_of(ddns="home.example.com, lab.example.com"))
-    p, fake = made()
+    fake = FakeLinode()
+    fake.records[1].append({"id": 105, "type": "A", "name": "home", "target": "198.51.100.8", "ttl_sec": 300})
+    p, fake = made(fake)
     p.refresh()
     p.ddns_update(force=False)
+    p.ddns_take_over("home.example.com", "198.51.100.7, 198.51.100.8")  # one A record kept: the other's DELETE
     st = p.status()
     forms = forms_of(st)
     web = table(st, "Linodes")["rows"][1]
@@ -95,13 +100,13 @@ def test_every_request_a_full_run_makes_is_one_the_card_names(made, env):
     p.ask("set_record", *page_args(forms["record-set:1"], {"name": "blog", "rtype": "A", "target": "203.0.113.7"}))
     p.set_record("example.com", "home", "A", "203.0.113.8")
     rid = next(r["id"] for r in fake.records[1] if r["name"] == "blog")
-    p.remove_record("example.com", rid)
+    p.remove_record("example.com", rid, "blog", "A", "203.0.113.7")
     p.ask("add_rule", *page_args(forms["rule-add:9"], {"direction": "inbound", "action": "ACCEPT", "protocol": "TCP",
                                                        "ports": "8080", "addresses": "203.0.113.9"}))
     row = table(p.status(), "web-fw rules")["rows"][2]
     p.ask("remove_rule", *page_args(forms_of(p.status())["rule-remove:9"], row[-1]["values"]))
     p.add_ssh_key("desk", pub("tester@desk", fill=3))
-    p.remove_ssh_key(5)
+    p.remove_ssh_key(5, "laptop")
     seen = set()
     for r in fake.requests:
         t = api.template_of(r["method"], r["path"])

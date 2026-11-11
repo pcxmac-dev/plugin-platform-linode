@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "plugin-platform-linode"
-version = "0.1.0"  # the plugin's own release (CHANGELOG.md); the platform shows it on the plugin's page
+version = "0.1.1"  # the plugin's own release (CHANGELOG.md); the platform shows it on the plugin's page
 description = "Linode (Akamai Cloud) for Liminal's platform: the account read through Linode's API v4 (Linodes with their prices, DNS Manager, Cloud Firewalls, volumes, SSH keys), free changes only, each confirmed, and Dynamic DNS."
 readme = "README.md"
 requires-python = ">=3.10"
 # the library it plugs into (the machine kind: liminal_libs.machines, plugin API 2.2; its REST client and Dynamic DNS
 # keeper: machines.rest, machines.ddns; the Login interface: liminal_libs.apps)
-dependencies = ["liminal-libs>=1.49.0"]
+dependencies = ["liminal-libs>=1.49.2"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

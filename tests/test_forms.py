@@ -5,6 +5,7 @@ Each hook sends exactly the request Linode's reference gives (method, path, body
 from __future__ import annotations
 
 import inspect
+import re
 
 import pytest
 
@@ -36,6 +37,8 @@ def test_the_forms_name_the_hooks_arguments_in_order_and_the_change_in_their_con
         assert all(x["type"] in FIELD_TYPES for x in f["fields"]) and f["confirm"]["title"] and f["confirm"]["yes"]
     assert "{linode}" in forms["power:shutdown"]["confirm"]["words"] and BILLS_OFF in forms["power:shutdown"]["confirm"]["words"]
     assert forms["power:shutdown"]["confirm"]["danger"] is True and forms["power:boot"]["confirm"]["danger"] is False
+    assert "Booting starts no new charge: a Linode bills the same" in forms["power:boot"]["confirm"]["words"]
+    assert "that record is changed to this one and what it held is dropped" in forms["record-set:1"]["confirm"]["words"]
     assert "{name} {rtype} {target}" in forms["record-set:1"]["confirm"]["words"]
     assert "Every other record is kept" in forms["record-remove:1"]["confirm"]["words"]
     for fid in ("rule-add:9", "rule-remove:9"):
@@ -145,7 +148,9 @@ def test_a_records_remove_deletes_that_record_alone_and_refuses_one_changed_mean
     with pytest.raises(Refusal, match="changed since it was read"):
         p.ask(form["hook"], *page_args(form, home[-1]["values"]))
     with pytest.raises(Refusal, match="no record 102 any more"):
-        p.remove_record("example.com", 102)
+        p.remove_record("example.com", 102, "@", "TXT", "v=spf1 mx -all")
+    with pytest.raises(ValueError, match="name the record as it was shown"):
+        p.remove_record("example.com", 104)  # its host, type and target as shown are needed: never removed unseen
     assert len(fake.writes()) == 1
 
 
@@ -174,27 +179,40 @@ def test_a_rule_added_writes_back_every_other_rule_and_the_policies_as_read(read
                                           "addresses": "0.0.0.0/0", "label": "", "description": "no pings out"}))
     assert fake.writes()[-1][2]["outbound"] == [{"action": "DROP", "protocol": "ICMP", "addresses": {"ipv4": ["0.0.0.0/0"]},
                                                  "description": "no pings out"}]
+    seen = fake.firewalls[0]["rules"]["fingerprint"]
     with pytest.raises(ValueError, match="has bits set below its mask"):
-        p.add_rule(9, None, "inbound", "ACCEPT", "TCP", "22", "203.0.113.7/24")
+        p.add_rule(9, seen, "inbound", "ACCEPT", "TCP", "22", "203.0.113.7/24")
     with pytest.raises(ValueError, match="at most 15 ports"):
-        p.add_rule(9, None, "inbound", "ACCEPT", "TCP", ",".join(str(1000 + i) for i in range(16)), "203.0.113.7")
+        p.add_rule(9, seen, "inbound", "ACCEPT", "TCP", ",".join(str(1000 + i) for i in range(16)), "203.0.113.7")
+    calls = len(fake.requests)
+    with pytest.raises(ValueError, match=r"the rules' fingerprint as they were shown \(seen\) is needed"):
+        p.add_rule(9, None, "inbound", "ACCEPT", "TCP", "8080", "203.0.113.9")
+    with pytest.raises(ValueError, match="name the rule as it was shown"):
+        p.remove_rule(9, seen, "inbound", 1)
+    assert len(fake.requests) == calls  # refused before anything is asked
 
 
 def test_a_rule_opening_ssh_or_every_port_to_the_internet_is_refused_until_accepted(ready):
     p, fake = ready
     form = forms_of(p.status())["rule-add:8"]  # db-fw lets SSH in from one address, its policy DROP
     values = {"direction": "inbound", "action": "ACCEPT", "protocol": "TCP", "ports": "22", "addresses": "0.0.0.0/0, ::/0"}
-    with pytest.raises(Refusal, match=r"opens SSH \(22\) to the whole internet on db-fw \(attached to db-1\)") as refused:
+    with pytest.raises(Refusal, match=r"opens SSH \(22\) to the whole internet on db-fw \(it guards db-1\)") as refused:
         p.ask(form["hook"], *page_args(form, values))
     assert refused.value.accept == ACCEPT_RISK and fake.writes() == []  # the argument the page's second confirmation sets
-    with pytest.raises(Refusal, match=r"opens every port and SSH \(22\)"):
+    with pytest.raises(Refusal, match=r"opens every TCP port \(SSH among them\) and every UDP port"):
         p.ask(form["hook"], *page_args(form, {**values, "protocol": "ALL", "ports": ""}))
-    with pytest.raises(Refusal, match="opens every port to the whole internet"):
+    with pytest.raises(Refusal, match="opens every UDP port to the whole internet"):
         p.ask(form["hook"], *page_args(form, {**values, "protocol": "UDP", "ports": ""}))
+    for port, words in (("3389", "RDP (3389)"), ("2375", "Docker (2375)"), ("3306", "MySQL (3306)")):  # asked twice now
+        with pytest.raises(Refusal, match=f"opens {re.escape(words)} to the whole internet"):
+            p.ask(form["hook"], *page_args(form, {**values, "ports": port}))
     assert fake.writes() == []
     rep = p.ask(form["hook"], *page_args(form, values, accepted={ACCEPT_RISK}))  # accepted: written
     assert fake.writes()[-1][0:2] == ("PUT", "/v4/networking/firewalls/8/rules") and rep["ok"]
-    assert rep["lines"][-1] == "accepted: the rule opens SSH (22) to the whole internet on db-fw (attached to db-1)"
+    assert rep["lines"][-1] == "accepted: the change opens SSH (22) to the whole internet on db-fw (it guards db-1)"
+    form = forms_of(p.status())["rule-add:8"]  # a web port opened to everyone: asked once
+    p.ask(form["hook"], *page_args(form, {**values, "ports": "443"}))
+    assert fake.writes()[-1][2]["inbound"][-1]["ports"] == "443"
     # where SSH is open to everyone already (web-fw), another such rule opens nothing more: asked once
     form = forms_of(p.status())["rule-add:9"]
     p.ask(form["hook"], *page_args(form, {**values, "ports": "22, 2222"}))
@@ -209,7 +227,7 @@ def test_removing_the_rule_letting_ssh_in_to_an_attached_linode_is_refused_until
     assert row[-1]["values"] == {"direction": "inbound", "position": 1,
                                  "rule": "ACCEPT TCP 22 from 203.0.113.7/32 (ssh-home)"}
     args = page_args(form, row[-1]["values"])
-    with pytest.raises(Refusal, match=r"lets SSH \(22\) in from 203.0.113.7/32 to db-1: without it SSH from there is dropped") as refused:
+    with pytest.raises(Refusal, match=r"ends SSH \(22\) from 203.0.113.7/32 to db-1, which db-fw let in") as refused:
         p.ask(form["hook"], *args)
     assert refused.value.accept == ACCEPT_RISK and fake.writes() == []
     rep = p.ask(form["hook"], *page_args(form, row[-1]["values"], accepted={ACCEPT_RISK}))
@@ -228,9 +246,45 @@ def test_a_dropping_rule_ending_ssh_to_an_attached_linode_is_asked_twice(ready):
     p, fake = ready
     fake.firewalls[1]["rules"] = rules_of([SSH_HOME], inbound_policy="ACCEPT", version=2)
     p.refresh()
+    seen = fake.firewalls[1]["rules"]["fingerprint"]
     with pytest.raises(Refusal, match=r"ends SSH \(22\) from 0.0.0.0/0 to db-1") as refused:
-        p.add_rule("db-fw", None, "inbound", "DROP", "TCP", "22", "0.0.0.0/0")
+        p.add_rule("db-fw", seen, "inbound", "DROP", "TCP", "22", "0.0.0.0/0")
     assert refused.value.accept == ACCEPT_RISK and fake.writes() == []
+
+
+def test_removing_a_drop_rule_that_kept_ssh_shut_is_asked_twice(ready):
+    """The audit's case (firewall.py:318 in 0.1.0): a DROP rule removed opened SSH to the whole internet on one
+    confirmation. Every change is weighed now by the policy and the rules left, before and after it."""
+    p, fake = ready
+    drop22 = {"action": "DROP", "protocol": "TCP", "ports": "22", "addresses": {"ipv4": ["0.0.0.0/0"], "ipv6": ["::/0"]}}
+    allow_all = {"action": "ACCEPT", "protocol": "ALL", "addresses": {"ipv4": ["0.0.0.0/0"], "ipv6": ["::/0"]}}
+    for inbound, policy in (([drop22], "ACCEPT"), ([drop22, allow_all], "DROP")):
+        fake.firewalls[0]["rules"] = rules_of(inbound, inbound_policy=policy, version=7)
+        p.refresh()
+        st = p.status()
+        form = forms_of(st)["rule-remove:9"]
+        row = table(st, "web-fw rules")["rows"][0]
+        assert row[-1]["values"]["rule"] == "DROP TCP 22 from 0.0.0.0/0, ::/0"
+        with pytest.raises(Refusal, match=r"the change opens every TCP port \(SSH among them\) to the whole internet on "
+                                          r"web-fw \(it guards web-1\)") as refused:
+            p.ask(form["hook"], *page_args(form, row[-1]["values"]))
+        assert refused.value.accept == ACCEPT_RISK and fake.writes() == []
+    rep = p.ask(form["hook"], *page_args(form, row[-1]["values"], accepted={ACCEPT_RISK}))
+    assert rep["ok"] and fake.writes()[-1][2]["inbound"] == [allow_all]
+
+
+def test_the_second_confirmation_counts_only_when_exactly_true(ready):
+    """accept_risk is honoured only when it is True (the page sends JSON true): a string, a 1 or anything else from a
+    local program is refused like no accept at all."""
+    p, fake = ready
+    seen = fake.firewalls[1]["rules"]["fingerprint"]
+    for almost in ("true", "yes", "false", 1, "1", [True], {"yes": True}):
+        with pytest.raises(Refusal, match="opens SSH") as refused:
+            p.add_rule("db-fw", seen, "inbound", "ACCEPT", "TCP", "22", "0.0.0.0/0", accept_risk=almost)
+        assert refused.value.accept == ACCEPT_RISK
+    assert fake.writes() == []
+    rep = p.add_rule("db-fw", seen, "inbound", "ACCEPT", "TCP", "22", "0.0.0.0/0", accept_risk=True)
+    assert rep["ok"] and fake.writes()[-1][1] == "/v4/networking/firewalls/8/rules"
 
 
 def test_rules_changed_since_the_page_read_them_are_never_written_over(ready):
@@ -252,7 +306,7 @@ def test_a_change_landing_between_the_read_and_the_write_is_said_with_the_rules_
     def elsewhere(f):  # another client's write, taken between this plugin's read and its write
         f["rules"] = {**f["rules"], "version": f["rules"]["version"] + 1}
     fake.meanwhile = elsewhere
-    rep = p.add_rule(9, None, "outbound", "DROP", "TCP", "25", "0.0.0.0/0")
+    rep = p.add_rule(9, fake.firewalls[0]["rules"]["fingerprint"], "outbound", "DROP", "TCP", "25", "0.0.0.0/0")
     assert rep["ok"] is False and rep["lines"][0].startswith("the rules went from version 3 to 5: another change was written")
     assert "  inbound 1: ACCEPT TCP 22 from 0.0.0.0/0, ::/0 (ssh)" in rep["lines"]
 
@@ -264,7 +318,7 @@ def test_rules_holding_a_field_this_plugin_does_not_know_are_not_written(ready):
     st = p.status()
     assert "rule-add:9" not in forms_of(st) and "not changed here" in table(st, "web-fw rules")["note"]
     with pytest.raises(Refusal, match=r"hold what this plugin does not know \(priority\)"):
-        p.add_rule(9, None, "inbound", "ACCEPT", "TCP", "8080", "203.0.113.9")
+        p.add_rule(9, fake.firewalls[0]["rules"]["fingerprint"], "inbound", "ACCEPT", "TCP", "8080", "203.0.113.9")
     assert fake.writes() == []
 
 
@@ -295,7 +349,9 @@ def test_an_ssh_key_is_added_and_removed_through_the_profile(ready):
     assert rep["ok"] and "keep it in their authorized_keys" in rep["lines"][0]
     assert [r[0] for r in table(p.status(), "SSH keys")["rows"]] == ["desk"]
     with pytest.raises(Refusal, match="no SSH key 5 any more"):
-        p.remove_ssh_key(5)
+        p.remove_ssh_key(5, "laptop")
+    with pytest.raises(ValueError, match="name the key as it was shown"):
+        p.remove_ssh_key(6)
 
 
 def test_errors_are_worded_with_the_token_taken_out(ready):
@@ -309,4 +365,4 @@ def test_errors_are_worded_with_the_token_taken_out(ready):
     assert TOKEN not in words and words == "POST /v4/domains/1/records: HTTP 400: target is invalid for token •••"
     fake.errors[("PUT", "/v4/networking/firewalls/9/rules")] = (403, "You do not have permission")
     with pytest.raises(Exception, match=r"HTTP 403: the token's access does not cover this .*Linode: You do not have permission"):
-        p.add_rule(9, None, "inbound", "ACCEPT", "TCP", "8080", "203.0.113.9")
+        p.add_rule(9, fake.firewalls[0]["rules"]["fingerprint"], "inbound", "ACCEPT", "TCP", "8080", "203.0.113.9")

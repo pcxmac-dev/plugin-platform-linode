@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.1.1 (2026-11-11)
+
+What an audit of the cloud plugins found before any key went in (session 87405e6a: eight reviewers, a skeptic per
+finding; the user's rule that a risky change is asked twice, and that nothing runs when the platform is not using it).
+Needs liminal-libs>=1.49.2.
+
+- **Every firewall change is weighed, whatever rule it adds or removes** (the audit: removing a DROP rule opened SSH to
+  the whole internet on one confirmation, firewall.py:318; RDP, Docker and the databases' ports were asked once): the
+  inbound policy and the rules left are compared before and after the change. One that lets the whole internet reach
+  every TCP or UDP port, or SSH, RDP, Telnet, SMB, VNC, Docker, the Kubernetes API or a database's port where it did not
+  before, or that ends SSH to a Linode the firewall guards, is refused once and asked again ("Change the firewall
+  anyway?"). A web port opened to everyone is still asked once.
+- **Dynamic DNS changes only what is its own** (the audit: a host listed in LINODE_DDNS_HOSTS had its live record
+  pointed at home within a minute, unasked, ddns.py:81), through liminal-libs 1.49.2's keeper: a host with no A record
+  made, one pointing here or at the address it set last kept current (its state in the platform's folder,
+  linode/ddns.json, so a restart after the network's address moved still knows it), and one holding another address,
+  or several, left as it is with a **Take over…** (its confirmation names what it holds) and the hook `ddns_take_over`
+  (refused when the host holds something else than the page showed); several addresses never cut to one unasked;
+  **Update DNS now** confirmed (a form, no longer one click); a host taken out of the settings let go; a CNAME host given
+  no A record beside it; a write sets the host's A record to exactly one address.
+- **The background reading runs only under the platform, and only once the token is set**: the charts app run alone,
+  which attaches every plugin it finds, starts nothing; entering the token starts it (`settings_changed`). **A pass ends
+  once detached**: it writes nothing more, and no setting is read from the process environment after a detach.
+- **The second confirmation counts only when it is exactly true** (`accept_risk is True`: a "yes", "false" or a 1 from a
+  local program is refused like none), and what the page showed is needed, never skipped when left out: the rules'
+  fingerprint and a removed rule's words, a removed record's host, type and target, a removed key's label.
+- **A token holding a space or a line break inside is refused**, never sent nor shown (the audit: requests' quoting of
+  the header escaped it past the scrub; liminal-libs 1.49.2 scrubs it too).
+- **Account Read Only by default**: Read/Write on Account only to add and remove the profile's SSH keys here (the audit:
+  that scope also lets a token make payments, add users and cancel the account).
+- The words: Boot's dialog says it starts no new charge (a Linode bills the same off); Set a record's says what a set
+  over a host's record drops; the command line's `ddns` asks yes as its other changes do.
+- Not this repo's: a private key pasted into Add an SSH key reached platform.log (the audit's blocker), which
+  liminal-platform 0.20.1 fixed (75acf30: a change asked of a plugin is logged without its values); the account read
+  every quarter of an hour while attached, and the ask route taking a change without the page, stay the user's and the
+  platform's to decide.
+
 ## 0.1.0 (2026-11-11)
 
 The first release (the user: "ALSO i would like to add two new plugins, Digital Ocean and LINODE"; for the cloud

@@ -9,9 +9,12 @@ read, one rule added or removed, and everything written back:
   the write, and the report says so with the rules as they were;
 - refused, nothing sent, when what was read cannot be written back as it is (a field this plugin does not know, no
   policies), or the change breaks the reference's limits (25 rules in all, 255 addresses a rule, 15 ports a rule);
-- a risky change is refused once and made only when accepted (ACCEPT_RISK: the page's second confirmation): an inbound rule
-  that opens SSH or every port to the whole internet, and a change that ends SSH from where a rule let it in to an attached
-  Linode (the rule letting SSH in removed, or a DROP added before nothing else lets it in).
+- a risky change is refused once and made only when accepted (ACCEPT_RISK, exactly true: the page's second
+  confirmation), whatever rule it adds or removes: each change is weighed by the inbound policy and the rules left, before
+  and after it (risk_of). Risky: a change that lets the whole internet reach every TCP or UDP port, or SSH, RDP, Docker,
+  a database's or another port servers are broken into through (SENSITIVE), where it did not before (an ACCEPT added, or
+  a DROP removed); and one that ends SSH, from where the rules let it in, to a Linode the firewall guards (an ACCEPT
+  removed, or a DROP added).
 
 Rules are applied in order, the first that matches deciding, else the direction's policy (ACCEPT or DROP). A rule:
 {action ACCEPT|DROP, protocol TCP|UDP|ICMP|IPENCAP|ALL, ports "22, 80, 443" or "1-65535" (TCP and UDP alone; none: every
@@ -37,6 +40,11 @@ SSH = 22
 EVERYONE = (ipaddress.ip_network("0.0.0.0/0"), ipaddress.ip_network("::/0"))
 ATTACHED_KINDS = frozenset({"linode", "linode_interface"})  # what SSH goes to (a NodeBalancer takes none)
 ACCEPT_RISK = "accept_risk"  # the hooks' argument accepting a risky change (the page's second confirmation)
+# the ports servers are broken into through when the whole internet reaches them (beside every port): a change newly
+# letting the internet in to one is asked twice (an audit, 2026-11-11: RDP, Docker and the databases were asked once)
+SENSITIVE = {22: "SSH", 23: "Telnet", 445: "SMB", 1433: "SQL Server", 2375: "Docker", 2376: "Docker over TLS",
+             3306: "MySQL", 3389: "RDP", 5432: "PostgreSQL", 5900: "VNC", 6379: "Redis", 6443: "the Kubernetes API",
+             9200: "Elasticsearch", 11211: "memcached", 27017: "MongoDB"}
 LABEL = re.compile(r"^[^\x00-\x1f\x7f]{3,32}$")
 
 
@@ -236,25 +244,99 @@ def words(rule: Mapping) -> str:
 
 
 # -- the risks -------------------------------------------------------------------------------------------------------------
-def opens(rules: Mapping, rule: Mapping) -> list[str]:
-    """What an inbound ACCEPT rule opens to the whole internet that the rules did not let in: SSH (22), every port."""
-    if str(rule.get("action")).upper() != "ACCEPT":
-        return []
-    wide = [n for n in EVERYONE if contains(rule, n)]
-    if not wide:
-        return []
-    inbound, policy = list(rules.get("inbound") or []), rules.get("inbound_policy")
+def explicit_ports(rules: Sequence[Mapping], protocol: str) -> list[tuple[int, int]]:
+    """The port ranges the rules of `protocol` name (a rule with no ports names none: it covers every port)."""
     out = []
-    if every_port(rule) and str(policy).upper() == "DROP":
-        out.append("every port")
-    if covers(rule, "TCP", SSH) and any(verdict(inbound, policy, n) == "DROP" for n in wide):
-        out.append("SSH (22)")
+    for r in rules:
+        if str(r.get("protocol") or "").upper() != protocol:
+            continue
+        for part in str(r.get("ports") or "").split(","):
+            a, _, b = part.strip().partition("-")
+            try:
+                out.append((int(a), int(b or a)))
+            except ValueError:
+                continue
     return out
+
+
+def stretches(rules: Sequence[Mapping], protocol: str) -> list[int]:
+    """A port from each stretch of ports that the rules of `protocol` treat alike (cut where a named range starts or
+    ends): what the rules do to that port, they do to its whole stretch."""
+    cuts = {1, 65536}
+    for lo, hi in explicit_ports(rules, protocol):
+        cuts |= {min(max(lo, 1), 65536), min(max(hi + 1, 1), 65536)}
+    edges = sorted(cuts)
+    return [a for a, b in zip(edges, edges[1:]) if a < b]
+
+
+def exposed(rules: Mapping) -> list[str]:
+    """What the whole internet (0.0.0.0/0, ::/0) reaches through the inbound rules and policy, in words: every TCP port,
+    every UDP port (each stretch of ports let in), and each of the ports servers are broken into through (SENSITIVE)."""
+    inbound, policy = list(rules.get("inbound") or []), rules.get("inbound_policy")
+    found: dict[str, int] = {}
+    for probe in EVERYONE:
+        for i, proto in enumerate(("TCP", "UDP")):
+            if all(verdict(inbound, policy, probe, proto, port) == "ACCEPT" for port in stretches(inbound, proto)):
+                found[f"every {proto} port"] = i - 2
+        for port, name in SENSITIVE.items():
+            if verdict(inbound, policy, probe, "TCP", port) == "ACCEPT":
+                found[f"{name} ({port})"] = port
+    return sorted(found, key=lambda k: found[k])
+
+
+def opened(before: Mapping, after: Mapping) -> list[str]:
+    """What a change opens to the whole internet: what it reaches after and did not before."""
+    was = set(exposed(before))
+    return [x for x in exposed(after) if x not in was]
+
+
+def opened_words(opens: Sequence[str]) -> str:
+    """What a change opens, in words: every TCP port standing for the TCP ports it holds (SSH named among them)."""
+    if "every TCP port" in opens:
+        parts = ["every TCP port" + (" (SSH among them)" if "SSH (22)" in opens else "")]
+        parts += [x for x in opens if x == "every UDP port"]
+    else:
+        parts = list(opens)
+    return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
 
 
 def ssh_lost(before: Sequence[Mapping], after: Sequence[Mapping], policy: str, probes: Iterable) -> list[str]:
     """The networks among `probes` that SSH reached through the inbound rules `before` and does not `after`."""
-    return [str(n) for n in probes if verdict(before, policy, n) == "ACCEPT" and verdict(after, policy, n) == "DROP"]
+    return [str(n) for n in dict.fromkeys(probes)
+            if verdict(before, policy, n) == "ACCEPT" and verdict(after, policy, n) == "DROP"]
+
+
+def ssh_probes(*rule_lists: Sequence[Mapping]) -> list:
+    """The networks SSH is judged from: the whole internet's and every network an inbound rule names, before or after."""
+    out = list(EVERYONE)
+    for rules in rule_lists:
+        for r in rules:
+            out += [n for n in nets_of(r) if n not in out]
+    return out
+
+
+def risk_of(before: Mapping, after: Mapping, firewall: Mapping, label: str) -> str | None:
+    """A change's risk in words (None: none), whatever rule it adds or removes: weighed by the inbound policy and the
+    rules left, before and after it. What it opens to the whole internet (every TCP or UDP port, SSH, RDP, a database's
+    or Docker's port: `exposed`), and the SSH it ends, from where the rules let it in, to a Linode the firewall guards
+    (you may lock yourself out)."""
+    bits = []
+    guards = attached_linodes(firewall)
+    opens = opened(before, after)
+    if opens:
+        bits.append(f"the change opens {opened_words(opens)} to the whole internet on {label}"
+                    + (f" (it guards {', '.join(guards)})" if guards else ""))
+    if guards:
+        b, a = list(before.get("inbound") or []), list(after.get("inbound") or [])
+        lost = ssh_lost(b, a, before.get("inbound_policy"), ssh_probes(b, a))
+        if lost:
+            bits.append(f"the change ends SSH (22) from {', '.join(lost)} to {', '.join(guards)}, which {label} let in: "
+                        "you may lock yourself out of them")
+    if not bits:
+        return None
+    off = "" if str(firewall.get("status") or "enabled") == "enabled" else \
+        f" ({label} is {firewall.get('status')} now: so once it is enabled)"
+    return "; ".join(bits) + off
 
 
 # -- the changes -----------------------------------------------------------------------------------------------------------
@@ -280,18 +362,7 @@ def plan_add(rules: Mapping, direction: str, rule: Mapping, firewall: Mapping, l
         raise Refusal(f"{label} has this {d} rule already: {words(rule)}")
     new = {**rules, d: [*(rules.get(d) or []), dict(rule)]}
     said = f"added the {d} rule {words(rule)} to {label} (after its other {d} rules)"
-    risk = None
-    if d == "inbound":
-        bits = opens(rules, rule)
-        if bits:
-            risk = (f"the rule opens {' and '.join(bits)} to the whole internet on {label}"
-                    + (f" (attached to {', '.join(attached_linodes(firewall))})" if attached_linodes(firewall) else ""))
-        elif str(rule.get("action")).upper() == "DROP" and covers(rule, "TCP", SSH) and attached_linodes(firewall):
-            lost = ssh_lost(rules.get("inbound") or [], new["inbound"], rules.get("inbound_policy"), nets_of(rule))
-            if lost:
-                risk = (f"the rule ends SSH (22) from {', '.join(lost)} to {', '.join(attached_linodes(firewall))}, which "
-                        f"{label} let in: you may lock yourself out of them")
-    return new, said, risk
+    return new, said, risk_of(rules, new, firewall, label)
 
 
 def plan_remove(rules: Mapping, direction: str, position, firewall: Mapping, label: str,
@@ -308,19 +379,12 @@ def plan_remove(rules: Mapping, direction: str, position, firewall: Mapping, lab
     if not 1 <= at <= len(current):
         raise Refusal(f"{label} has no {d} rule {at} (it has {len(current)}): nothing removed")
     gone = current[at - 1]
-    if shown not in (None, "") and " ".join(str(shown).split()) != " ".join(words(gone).split()):
+    if shown in (None, ""):
+        raise ValueError(f"name the rule as it was shown ({d} rule {at} in words), so a rule that moved is not removed unseen")
+    if " ".join(str(shown).split()) != " ".join(words(gone).split()):
         raise Refusal(f"{d} rule {at} of {label} is {words(gone)} now, not {shown}: the rules changed since they were "
                       "read, so nothing is removed (read them again)")
     rest = current[: at - 1] + current[at:]
     new = {**rules, d: rest}
     said = f"removed the {d} rule {at} of {label}: {words(gone)}"
-    risk = None
-    if d == "inbound" and str(gone.get("action")).upper() == "ACCEPT" and covers(gone, "TCP", SSH):
-        targets = attached_linodes(firewall)
-        lost = ssh_lost(current, rest, rules.get("inbound_policy"), nets_of(gone)) if targets else []
-        if lost:
-            off = "" if str(firewall.get("status") or "enabled") == "enabled" else \
-                f" ({label} is {firewall.get('status')} now: once enabled)"
-            risk = (f"the rule lets SSH (22) in from {', '.join(lost)} to {', '.join(targets)}: without it SSH from there is "
-                    f"dropped{off}, and you may lock yourself out of them")
-    return new, said, risk
+    return new, said, risk_of(rules, new, firewall, label)

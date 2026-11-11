@@ -4,17 +4,22 @@ charges so far, the Linodes with their plans and prices, DNS Manager's domains a
 their rules and what they guard, the volumes, the profile's SSH keys, the reserved IPs, and counts of the rest (Kubernetes
 clusters, NodeBalancers, databases, buckets, images, VPCs, placement groups). It changes only what costs nothing, each
 change confirmed first: a Linode booted, shut down or rebooted; a DNS record set or removed (every other record kept); a
-Cloud Firewall rule added or removed (the whole set written back as read, refused when it changed meanwhile; one that
-opens SSH or every port to the whole internet, or ends SSH to an attached Linode, asked twice); an SSH key added to the
-profile or removed. And Dynamic DNS keeping hosts of DNS Manager's domains at this network's public IPv4 address. Nothing
-that starts a charge: no Linode, volume, snapshot, backup or reserved IP made, nothing resized or destroyed. A powered-off
-Linode still bills (Akamai's pricing FAQ), and the page says so.
+Cloud Firewall rule added or removed (the whole set written back as read, refused when it changed meanwhile; a change
+that opens every port, SSH or another port servers are broken into through to the whole internet, or that ends SSH to a
+Linode the firewall guards, asked twice, whatever rule it adds or removes); an SSH key added to the profile or removed.
+And Dynamic DNS keeping hosts of DNS Manager's domains at this network's public IPv4 address: only what is its own (a host
+holding another address is left as it is until taken over on the page). Nothing that starts a charge: no Linode, volume,
+snapshot, backup or reserved IP made, nothing resized or destroyed. A powered-off Linode still bills (Akamai's pricing
+FAQ), and the page says so.
 
 Its settings are pairs asked of the login of the app it is attached to (settings.py: LINODE_TOKEN, LINODE_DDNS_HOSTS,
-LINODE_DDNS_MINUTES), never a file of its own. While attached to the platform app it reads the account every quarter of
-an hour and checks the Dynamic DNS hosts every few minutes in a thread of its own; detached, nothing of it runs. Its
-status is what was read last (no request is made to answer it): the platform's page draws its tables, its actions
-(Refresh, Update DNS now) and its forms, and its API card (card.py: plugin API 2.2).
+LINODE_DDNS_MINUTES), never a file of its own. Attached to the platform app, once the token is set, it reads the account
+every quarter of an hour and checks the Dynamic DNS hosts every few minutes in a thread of its own; attached by another
+app, or detached, nothing of it runs, and once detached no setting is read. Its status is what was read last (no request
+is made to answer it): the platform's page draws its tables, its actions (Refresh, Update DNS now) and its forms, and its
+API card (card.py: plugin API 2.2).
+
+0.1.1 (2026-11-11) is what an audit of the cloud plugins found before any key went in: see CHANGELOG.md.
 
     python -m plugin_platform_linode status | servers | domains | records DOMAIN | ddns [--now] | firewalls | keys
         | power LINODE on|off|reboot | set DOMAIN HOST TYPE TARGET [--ttl N] [--priority N] [--tag T]
@@ -26,6 +31,7 @@ import base64
 import binascii
 import hashlib
 import ipaddress
+import json
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -40,11 +46,11 @@ from . import records as rec
 from . import settings as settings_mod
 from .api import COUNTED, LinodeApi
 from .card import APIS, LINODE_API
-from .ddns import PUBLIC_IPV4, LinodeDns
+from .ddns import PUBLIC_IPV4, LinodeDns, state_path
 from .refusal import Refusal
 from .settings import ACCESS_SHORT, DDNS_HOSTS, KEYS, NAMES, SCOPE_WORDS, TOKEN, TOKEN_PAGE, Config
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 REFRESH_S = 900.0  # the account read again at most this often while attached (or by Refresh)
 CONFIG_S = 30.0  # the settings asked of the login again after this long
 RETRY_S = 900.0  # a read that failed is taken as untried after this long while detached: attached again, it is tried again
@@ -59,7 +65,8 @@ RUNNING = "running"
 OFF = frozenset({"offline", "stopped"})
 POWER_WORDS = {  # action -> (its title, done in words, the confirmation's words, dangerous)
     "boot": ("Boot", "booting", "{linode} is booted (powered on) with its configuration (where it has several, the one it "
-                                "last booted). It bills by the hour, running or off.", False),
+                                "last booted). Booting starts no new charge: a Linode bills the same by the hour whether it "
+                                "runs or is off.", False),
     "shutdown": ("Shut down", "shutting down", "{linode} is shut down (powered off) until it is booted again: its services "
                                                "stop. Save unsaved work on it first: Linode's API does not say how long it "
                                                "waits for the system to stop. " + BILLS_OFF, True),
@@ -165,6 +172,16 @@ def fingerprint_of(text) -> str:
         return ""
 
 
+def typed_host(text) -> str:
+    """A Dynamic DNS host as typed, as the keeper names it: lowercase, without @. for the domain itself, nor a final dot."""
+    name = str(text or "").strip().rstrip(".").lower()
+    return name[2:] if name.startswith("@.") else name
+
+
+class _Detached(Exception):
+    """The plugin was detached during a read: it ends there."""
+
+
 @dataclass(frozen=True)
 class Trouble:
     """A part of the account that could not be read, in words; `denied`: the token's access does not cover it (403)."""
@@ -195,6 +212,8 @@ class _Runtime:
         self.ddns_at: float | None = None
         self.keeper: Keeper | None = None
         self.dns: LinodeDns | None = None
+        self.ddns_known: set[str] | None = None  # the hosts the keeper may hold as its own (let go once out of the settings)
+        self.detached = threading.Event()  # set by a detach: a pass under way writes nothing more, no settings are read
         self.worker: threading.Thread | None = None
         self.stop: threading.Event | None = None
         self.wake = threading.Event()
@@ -214,7 +233,8 @@ class LinodePlugin(MachinePlugin):
     order = 761
     ICON = "linode"  # Linode's prism (liminal-libs 1.49.0's icons.js)
     HOOKS = (*MachinePlugin.HOOKS, "refresh", "linodes", "domains", "records", "firewalls", "ssh_keys", "power",
-             "set_record", "remove_record", "add_rule", "remove_rule", "add_ssh_key", "remove_ssh_key", "ddns_update")
+             "set_record", "remove_record", "add_rule", "remove_rule", "add_ssh_key", "remove_ssh_key", "ddns_update",
+             "ddns_take_over")
     keys = KEYS
     signup = TOKEN_PAGE
     limits = ("Linode's API: 200 list requests a minute and 1,600 others; the plugin makes about 20 a quarter of an hour "
@@ -230,10 +250,14 @@ class LinodePlugin(MachinePlugin):
 
     # -- the settings, the API, the Dynamic DNS keeper --------------------------------------------------------------------
     def config(self, fresh: bool = False) -> Config:
-        """The settings, asked of the login (the attached app's, else the environment's); kept CONFIG_S."""
+        """The settings, asked of the login (the attached app's, else the environment's); kept CONFIG_S. Once detached,
+        none until a login is lent again (an audit, 2026-11-11: a pass outliving its detach must read no settings from
+        the process environment)."""
         now = time.monotonic()
         with self._rt.lock:
             kept = self._rt.config
+        if self.login is None and self._rt.detached.is_set():
+            return Config()
         if kept is not None and not fresh and now - kept[0] < CONFIG_S:
             return kept[1]
         cfg = settings_mod.read(self.login)
@@ -243,9 +267,12 @@ class LinodePlugin(MachinePlugin):
 
     def settings_changed(self) -> None:
         """Its settings were just entered (liminal-platform 0.9.0: Settings… on its page, kept through the login): read
-        anew at once, a failed read tried again at once (no wait for its retry)."""
+        anew at once, a failed read tried again at once (no wait for its retry); the background reading started if it
+        is attached to the platform and the token is set now."""
         with self._rt.lock:
             self._rt.config = None
+        if self._on_platform() and not self.working:
+            self._start_if_set()
 
     def client(self) -> LinodeApi:
         """The API with the settings as they are (ValueError when the token is not set)."""
@@ -262,11 +289,14 @@ class LinodePlugin(MachinePlugin):
         return made
 
     def keeper(self) -> Keeper:
+        """The Dynamic DNS keeper (liminal-libs 1.49.2): what is its own and what it was let take over kept in the
+        platform's folder (ddns.state_path), the records of a pass read afresh at its start."""
         with self._rt.lock:
             if self._rt.keeper is None:
                 self._rt.dns = LinodeDns(self.client, self._domain_id)
                 self._rt.keeper = Keeper(read=self._rt.dns.read, write=self._rt.dns.write, servers=PUBLIC_IPV4,
-                                         public=self._public, clock=self._clock)
+                                         public=self._public, clock=self._clock, on_pass=self._rt.dns.begin,
+                                         state=state_path())
             return self._rt.keeper
 
     # -- what was read, kept ------------------------------------------------------------------------------------------------
@@ -362,35 +392,47 @@ class LinodePlugin(MachinePlugin):
             self._rt.types = (now, by_id)
         return by_id
 
-    def _refresh(self, cfg: Config) -> dict:
+    def _refresh(self, cfg: Config, stop: threading.Event | None = None) -> dict:
         now = self._clock()
+        if stop is not None and stop.is_set():
+            return {"detached": True}
         try:
             api = self.client()
             profile = api.profile()  # first: a token refused stops the read here
         except (RestError, ValueError) as e:
+            if stop is not None and stop.is_set():
+                return {"detached": True}  # detached meanwhile (its settings gone with its login): nothing of it kept
             with self._rt.lock:
                 self._rt.api_ok, self._rt.api_error, self._rt.api_error_at, self._rt.api_print = False, str(e), now, cfg.api_print
             raise
-        read: dict = {"at": now, "profile": profile}
-        read["account"] = self._try(api.account, "the account")
-        read["transfer"] = self._try(api.transfer, "the transfer pool")
-        read["linodes"] = self._try(api.linodes, "Linodes")
-        read["types"] = self._types(api, now)
-        read["domains"] = self._try(api.domains, "Domains")
-        records: dict[int, object] = {}
-        if isinstance(read["domains"], list):
-            masters = [d for d in read["domains"] if str(d.get("type") or "master") == "master" and d.get("id")]
-            for d in masters[:DOMAINS_MAX]:
-                records[int(d["id"])] = self._try(lambda d=d: api.records(d["id"]), "Domains")
-            for d in masters[DOMAINS_MAX:]:
-                records[int(d["id"])] = Trouble(f"not read with the rest (more than {DOMAINS_MAX} domains): "
-                                                f"python -m plugin_platform_linode records {d.get('domain')}")
-        read["records"] = records
-        read["firewalls"] = self._try(api.firewalls, "Firewalls")
-        read["volumes"] = self._try(api.volumes, "Volumes")
-        read["keys"] = self._try(api.ssh_keys, "SSH keys")
-        read["reserved"] = self._try(api.reserved_ips, "IPs")
-        read["counts"] = {k: self._try(lambda k=k: api.count(k), words) for k, words, *_ in COUNTED}
+
+        def get(read_part, area: str):  # one part; none once detached (the read ends there, nothing of it kept)
+            if stop is not None and stop.is_set():
+                raise _Detached()
+            return self._try(read_part, area)
+        try:
+            read: dict = {"at": now, "profile": profile}
+            read["account"] = get(api.account, "the account")
+            read["transfer"] = get(api.transfer, "the transfer pool")
+            read["linodes"] = get(api.linodes, "Linodes")
+            read["types"] = self._types(api, now)
+            read["domains"] = get(api.domains, "Domains")
+            records: dict[int, object] = {}
+            if isinstance(read["domains"], list):
+                masters = [d for d in read["domains"] if str(d.get("type") or "master") == "master" and d.get("id")]
+                for d in masters[:DOMAINS_MAX]:
+                    records[int(d["id"])] = get(lambda d=d: api.records(d["id"]), "Domains")
+                for d in masters[DOMAINS_MAX:]:
+                    records[int(d["id"])] = Trouble(f"not read with the rest (more than {DOMAINS_MAX} domains): "
+                                                    f"python -m plugin_platform_linode records {d.get('domain')}")
+            read["records"] = records
+            read["firewalls"] = get(api.firewalls, "Firewalls")
+            read["volumes"] = get(api.volumes, "Volumes")
+            read["keys"] = get(api.ssh_keys, "SSH keys")
+            read["reserved"] = get(api.reserved_ips, "IPs")
+            read["counts"] = {k: get(lambda k=k: api.count(k), words) for k, words, *_ in COUNTED}
+        except _Detached:
+            return {"detached": True}
         with self._rt.lock:
             self._rt.read, self._rt.refreshed_at = read, now
             self._rt.api_ok, self._rt.api_error, self._rt.api_error_at, self._rt.api_print = True, "", None, cfg.api_print
@@ -526,8 +568,11 @@ class LinodePlugin(MachinePlugin):
         return self._checked(api, d, before, change, written)
 
     def remove_record(self, domain, record, name=None, rtype=None, target=None) -> dict:
-        """A record removed by its id (records.plan_remove: refused when it is gone or holds what was not shown), the
-        rest kept; checked after."""
+        """A record removed by its id (records.plan_remove: refused when it is gone or holds what was not shown: its host,
+        type and target as shown, each needed), the rest kept; checked after."""
+        if name is None or rtype is None or target is None:
+            raise ValueError("name the record as it was shown (its host, its type and its target), so a record that changed "
+                             "is never removed unseen")
         api = self.client()
         d = self._domain(domain, write=True)
         before = api.records(d["id"])
@@ -585,24 +630,30 @@ class LinodePlugin(MachinePlugin):
                                   accept_risk)
 
     def remove_rule(self, firewall, seen, direction, position, rule=None, accept_risk=False) -> dict:
-        """A Cloud Firewall's rule removed by its place in its direction (`rule`: it in words, as shown), the rest written
-        back as read (firewall.plan_remove)."""
+        """A Cloud Firewall's rule removed by its place in its direction (`rule`: it in words, as shown, needed), the rest
+        written back as read (firewall.plan_remove)."""
+        if rule in (None, ""):
+            raise ValueError(f"name the rule as it was shown ({direction} rule {position} in words), so a rule that moved is "
+                             "not removed unseen")
         return self._rules_change(firewall, seen,
                                   lambda rules, f, name: fw.plan_remove(rules, direction, position, f, name, rule),
                                   accept_risk)
 
     def _rules_change(self, firewall, seen, plan, accept_risk) -> dict:
+        if seen in (None, ""):
+            raise ValueError("the rules' fingerprint as they were shown (seen) is needed, so a change made meanwhile is "
+                             "never written over unseen: read them first")
         api = self.client()
         f = self._firewall(firewall)
         name = str(f.get("label") or f.get("id"))
         before = api.rules(f["id"])
         self._keep_rules(int(f["id"]), before)
-        if seen not in (None, "") and str(seen) != str(before.get("fingerprint")):
+        if str(seen) != str(before.get("fingerprint")):
             raise Refusal(f"the rules of {name} changed since they were read (they are version {before.get('version')} "
                           f"now, fingerprint {before.get('fingerprint')}): look at them again before changing them; "
                           "nothing was sent")
         new, said, risk = plan(before, f, name)
-        if risk and not accept_risk:
+        if risk and accept_risk is not True:  # the page's second confirmation sends true; nothing else counts
             raise Refusal(f"{risk}. Nothing was sent: a change like this is made only once it is accepted as well "
                           f"({fw.ACCEPT_RISK}: the platform's page asks a second time)", accept=fw.ACCEPT_RISK)
         body = fw.body_of(new)
@@ -647,7 +698,11 @@ class LinodePlugin(MachinePlugin):
                           "their root user); no Linode running now is changed"], "ok": True, "changed": True, "key": made.get("id") if isinstance(made, Mapping) else None}
 
     def remove_ssh_key(self, key, label=None) -> dict:
-        """An SSH key removed from the profile by its id (refused when it is gone or holds another label now)."""
+        """An SSH key removed from the profile by its id (refused when it is gone or holds another label now than the one
+        shown, which is needed: "" for a key without one)."""
+        if label is None:
+            raise ValueError("name the key as it was shown (its label; \"\" for a key without one), so another key is "
+                             "never removed unseen")
         try:
             kid = int(str(key).strip())
         except (TypeError, ValueError):
@@ -658,7 +713,7 @@ class LinodePlugin(MachinePlugin):
         if k is None:
             self._keep("keys", there)
             raise Refusal(f"your profile holds no SSH key {kid} any more: nothing removed")
-        if label not in (None, "") and " ".join(str(label).split()) != " ".join(str(k.get("label") or "").split()):
+        if " ".join(str(label).split()) != " ".join(str(k.get("label") or "").split()):
             raise Refusal(f"SSH key {kid} is labelled {k.get('label')!r} now, not {label!r}: nothing removed (read it again)")
         api.delete_ssh_key(kid)
         self._keep("keys", [x for x in there if int(x.get("id") or 0) != kid])
@@ -667,40 +722,104 @@ class LinodePlugin(MachinePlugin):
                           "profile (take it off them by hand)"], "ok": True, "changed": True}
 
     def ddns_update(self, force: bool = True) -> list[dict]:
-        """A Dynamic DNS pass now (the page's Update DNS now: `force`, every host's record set whether it differs or not;
-        the command line's `ddns` without --now sets only those that differ)."""
+        """A Dynamic DNS pass now (the page's Update DNS now, once confirmed: `force`, every host of the keeper's own set
+        whether it differs or not; the command line's `ddns` without --now sets only those that differ). A host holding
+        another address is left as it is either way (Take over… on the page)."""
         cfg = self.config(fresh=True)
         if not cfg.ddns_ready:
             raise ValueError(f"Dynamic DNS is not set up: {DDNS_HOSTS} and {TOKEN}")
         return self._ddns_pass(cfg, bool(force))
 
-    def _ddns_pass(self, cfg: Config, force: bool, wait: float = 120.0) -> list[dict]:
+    def ddns_take_over(self, host, holds=None) -> list[dict]:
+        """A host of LINODE_DDNS_HOSTS that holds another address taken over (the page's Take over…, once confirmed:
+        liminal-libs 1.49.2's take_over), then a pass for that host, which points its A record at this network's address.
+        `holds`: what the page showed it holding; holding something else now, it is refused and nothing is taken over."""
+        cfg = self.config(fresh=True)
+        if not cfg.ddns_ready:
+            raise ValueError(f"Dynamic DNS is not set up: {DDNS_HOSTS} and {TOKEN}")
+        if self._masters() is None:
+            self.domains()
+        hosts, _ = hosts_of(cfg.hosts, [d.get("domain") for d in self._masters() or []])
+        want = typed_host(host)
+        h = next((x for x in hosts if x.fqdn == want), None)
+        if h is None:
+            raise ValueError(f"{host} is not one of {DDNS_HOSTS} in a master domain of this account's DNS Manager")
+        k = self.keeper()
+        if holds is not None:
+            self._rt.dns.begin()
+            now = self._rt.dns.read(h)
+            shown = [a.strip() for a in str(holds).split(",") if a.strip()]
+            if sorted(now) != sorted(shown):
+                raise Refusal(f"{h.fqdn} holds {', '.join(now) or 'no A record'} now, not {holds or 'nothing'}: look at it "
+                              "again; nothing is taken over")
+        k.take_over(h.fqdn)
+        return self._ddns_pass(cfg, force=False, only={h.fqdn})
+
+    def _ddns_pass(self, cfg: Config, force: bool, wait: float = 120.0, stop: threading.Event | None = None,
+                   only: set[str] | None = None) -> list[dict]:
+        """A pass of the keeper over the hosts set (`only`: these), ended before its next write once detached (`stop`,
+        the worker's; else the plugin's own detach)."""
+        stop = stop if stop is not None else self._rt.detached
+        if stop.is_set():
+            return []  # detached: nothing asked, nothing written
         if self._masters() is None:
             self.domains()  # the zones it may keep hosts in: read once
         hosts, _ = hosts_of(cfg.hosts, [d.get("domain") for d in self._masters() or []])
         k = self.keeper()
-        self._rt.dns.begin()
-        out = k.run_pass(hosts, force=force, wait=wait)
+        self._let_go(cfg, k)
+        if only is not None:
+            hosts = [h for h in hosts if h.fqdn in only]
+        out = k.run_pass(hosts, force=force, wait=wait, stop=stop)
         with self._rt.lock:
             self._rt.ddns_print, self._rt.ddns_at = cfg.ddns_print, self._clock()
         return out
 
+    def _let_go(self, cfg: Config, k: Keeper) -> None:
+        """The hosts taken out of LINODE_DDNS_HOSTS let go (the keeper's let_go: neither its own nor taken over any more,
+        so one listed again later is asked about again); the first time, the ones its state file holds."""
+        typed = {typed_host(x) for x in cfg.hosts.replace(";", ",").replace(" ", ",").split(",") if x.strip()}
+        with self._rt.lock:
+            known = self._rt.ddns_known
+        if known is None:
+            known = set()
+            try:
+                data = json.loads(state_path().read_text(encoding="utf-8"))
+                known = {str(x).lower() for x in [*(data.get("own") or {}), *(data.get("taken") or [])]}
+            except (OSError, ValueError, AttributeError, TypeError):
+                pass
+        for fqdn in sorted(known - typed):
+            k.let_go(fqdn)
+        with self._rt.lock:
+            self._rt.ddns_known = typed
+
     # -- attached: the reading in the background ----------------------------------------------------------------------------
     def attach(self, app, login=None) -> dict:
-        """Attached by the platform: its settings asked of the platform's login from now on; the account read and the
-        Dynamic DNS hosts checked in the background."""
+        """Attached: its settings asked of the app's login from now on. Attached by the platform, and once the token is
+        set, the account read and the Dynamic DNS hosts checked in the background (an audit, 2026-11-11: the charts app run
+        alone attaches every plugin it finds, which must not start this)."""
         interface = super().attach(app, login)
         with self._rt.lock:
             self._rt.config = None
-        self._start()
+            self._rt.detached.clear()
+        if self._on_platform():
+            self._start_if_set()
         return interface
 
     def detach(self) -> None:
-        """Detached (the platform ending, the plugin disabled or not valid): the background reading ends."""
+        """Detached (the platform ending, the plugin disabled or not valid): the background reading ends, and a pass
+        under way writes nothing more."""
+        self._rt.detached.set()
         self._stop()
         super().detach()
         with self._rt.lock:
             self._rt.config = None
+
+    def _on_platform(self) -> bool:
+        return getattr(self.app, "NAME", "") == "platform"
+
+    def _start_if_set(self) -> None:
+        if self.config().ready:
+            self._start()
 
     @property
     def working(self) -> bool:
@@ -730,18 +849,21 @@ class LinodePlugin(MachinePlugin):
 
     def _work(self, stop: threading.Event) -> None:
         """The background: the account read every REFRESH_S, the Dynamic DNS hosts checked every LINODE_DDNS_MINUTES;
-        nothing done for what is not set."""
+        it ends when the token is no longer set (entering it starts it again: settings_changed) or once detached (`stop`:
+        a pass under way writes nothing more)."""
         next_api = next_ddns = 0.0
         while not stop.is_set():
             now = time.monotonic()
             cfg = None
             try:
                 cfg = self.config()
-                if cfg.ready and now >= next_api:
+                if not cfg.ready or stop.is_set():
+                    break
+                if now >= next_api:
                     next_api = now + REFRESH_S
                     if self._rt.refreshing.acquire(blocking=False):  # Refresh asked meanwhile: that one is enough
                         try:
-                            self._refresh(cfg)
+                            self._refresh(cfg, stop)
                         except Exception:  # noqa: BLE001 - kept as its outcome (api_error), shown by the status
                             pass
                         finally:
@@ -749,7 +871,7 @@ class LinodePlugin(MachinePlugin):
                 if cfg.ddns_ready and now >= next_ddns and not stop.is_set():
                     next_ddns = now + cfg.minutes * 60.0
                     try:
-                        self._ddns_pass(cfg, force=False, wait=0.5)
+                        self._ddns_pass(cfg, force=False, wait=0.5, stop=stop)
                     except Exception:  # noqa: BLE001 - a pass under way (Update DNS now), or its trouble kept by the hosts
                         pass
             except Exception:  # noqa: BLE001 - the background never ends on a trouble; the status says it
@@ -793,7 +915,8 @@ class LinodePlugin(MachinePlugin):
         set_names = ", ".join(n for n in NAMES if n in cfg.present)
         missing = ", ".join(n for n in NAMES if n not in cfg.present)
         if not cfg.ready:
-            return {"present": True, "valid": False, "why": f"{TOKEN} is not set: " + NOT_SET, "summary": "no token set",
+            why = cfg.token_problem or f"{TOKEN} is not set: " + NOT_SET
+            return {"present": True, "valid": False, "why": why, "summary": "no token usable" if cfg.token_problem else "no token set",
                     "settingsSet": set_names, "settingsNotSet": missing, "tables": [], "actions": [], "forms": []}
         rt, now, attached = self._rt, self._clock(), self.app is not None
         with rt.lock:
@@ -826,10 +949,13 @@ class LinodePlugin(MachinePlugin):
             out["ddnsEvery"] = f"every {cfg.minutes:g} min" + ("" if attached else ", once attached")
         out["tables"] = self._tables(cfg, read, masters, hosts, keeper, attached)
         out["forms"] = self._forms(read) if works is not False else []
+        if cfg.ddns_ready and works is not False:  # Take over… and Update DNS now, each confirmed (liminal-libs 1.49.2)
+            k = keeper if keeper is not None else self.keeper()
+            out["forms"] += [k.take_form(), k.now_form()]
         out["actions"] = [{"hook": "refresh", "args": [], "title": "Refresh",
                            "note": "the account read again now (about 20 requests)"}] + \
-                         ([{"hook": "ddns_update", "args": [], "title": "Update DNS now",
-                            "note": "every Dynamic DNS host's A record set now to this network's address"}]
+                         ([{"form": "ddns-now", "title": "Update DNS now",
+                            "note": "the Dynamic DNS hosts of its own set now to this network's address, once confirmed"}]
                           if cfg.ddns_ready else [])
         return out
 
@@ -958,9 +1084,10 @@ class LinodePlugin(MachinePlugin):
                             "empty": f"No host could be read in {DDNS_HOSTS}."})
             else:
                 k = keeper if keeper is not None else self.keeper()
-                table = k.table(hosts, cfg.minutes, attached, when=when)
-                table["note"] += " · through Linode's DNS Manager (a new record: TTL 300)"
-                table["empty"] = f"No host of {DDNS_HOSTS} is in a master domain of this account's DNS Manager."
+                table = k.table(hosts, cfg.minutes, attached, when=when, take=True,
+                                empty=f"No host of {DDNS_HOSTS} is in a master domain of this account's DNS Manager.")
+                table["note"] += (" · through Linode's DNS Manager (a new record: TTL 300; A records only, a host's AAAA "
+                                  "records left as they are)")
                 out.append(table)
         if not read:
             return out
@@ -1257,8 +1384,11 @@ class LinodePlugin(MachinePlugin):
                         {"name": "tag", "label": "CAA tag", "type": "choice", "value": "issue", "when": {"rtype": ["CAA"]},
                          "choices": [{"value": t, "title": t, "note": CAA_NOTES[t]} for t in rec.CAA_TAGS]}],
              "submit": "Review the change",
-             "confirm": {"title": f"Set this record in {name}?", "words": "{name} {rtype} {target} is set in {domain}. " + kept,
-                         "yes": "Set the record"}},
+             "confirm": {"title": f"Set this record in {name}?",
+                         "words": ("{name} {rtype} {target} is set in {domain}. Where {name} holds a record of that type "
+                                   "already (an A, AAAA or CNAME, as its table shows), that record is changed to this one "
+                                   "and what it held is dropped; a TXT, MX, NS or CAA record is added beside the others. "
+                                   + kept), "yes": "Set the record"}},
             {"id": f"record-remove:{did}", "hook": "remove_record", "title": f"Remove a record from {name}",
              "fields": [domain, {"name": "record", "label": "Record id", "type": "fixed"},
                         {"name": "name", "label": "Host", "type": "fixed"}, {"name": "rtype", "label": "Type", "type": "fixed"},

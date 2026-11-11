@@ -30,8 +30,9 @@ def test_nothing_set_is_not_valid_and_names_the_token_and_where_to_make_it(made)
     st = p.status()
     assert st["present"] is False and st["valid"] is False and st["why"] == NOT_SET and fake.requests == []
     assert "LINODE_TOKEN" in st["why"] and "https://cloud.linode.com/profile/tokens" in st["why"]
-    for words in ("Read/Write for Linodes, Domains, Firewalls, Account", "Read Only for Volumes", *SCOPES):
+    for words in ("Read/Write for Linodes, Domains, Firewalls (", "Read Only for Account, Volumes", *SCOPES):
         assert words in st["why"]  # the access it needs, in Linode's own scopes
+    assert "Only to add and remove the profile's SSH keys here: Account Read/Write (account:read_write" in st["why"]
     assert st["tables"] == [] and st["actions"] == [] and st["forms"] == [] and not p.present()
     with pytest.raises(ValueError, match="the API is not set up"):
         p.refresh()
@@ -82,7 +83,8 @@ def test_a_refresh_draws_the_account_in_tables_and_the_status_asks_nothing(made,
     assert st["thisMonth"].startswith("$12.34 so far") and st["credit"] == "$50.00 of promotions left"
     assert st["transfer"] == "12 of 5,000 GB used this cycle" and st["linodesMonthly"].startswith("$36.00 a month")
     assert st["settingsSet"] == "LINODE_TOKEN" and st["readAt"] == done["refreshedAt"]
-    assert st["tokenNeeds"] == "Read/Write: Linodes, Domains, Firewalls, Account; Read Only: the rest it shows"
+    assert st["tokenNeeds"] == ("Read/Write: Linodes, Domains, Firewalls; Read Only: the rest it shows (Account too, "
+                                "unless SSH keys are changed here)")
     assert [t["title"] for t in st["tables"]] == [
         "Linodes", "Domains", "example.com records", "Cloud Firewalls", "db-fw rules", "web-fw rules", "Volumes",
         "SSH keys", "Reserved IPs", "The rest of the account"]
@@ -191,22 +193,78 @@ def test_what_it_learned_of_the_api_comes_from_the_answers_alone(made, env):
     assert facts["Account read"] != "not yet" and "Plans and prices read" in facts
 
 
-def test_attached_it_reads_in_the_background_through_the_apps_login_and_detached_nothing_runs(made):
+class Platform:
+    """A stand-in for the platform app (its NAME: the one app whose attach starts the background reading)."""
+
+    NAME = "platform"
+
+
+class Charts:
+    """A stand-in for the charts app run alone, which attaches every plugin it finds."""
+
+    NAME = "charts"
+
+
+def test_attached_by_the_platform_it_reads_in_the_background_and_detached_nothing_runs(made, env):
     p, fake = made()
-    login = Pairs(settings_of(ddns="home.example.com"))
-    p.attach(object(), login)
+    login = Pairs(settings_of(ddns="lab.example.com"))
+    p.attach(Platform(), login)
     try:
-        assert wait_until(lambda: p.status()["summary"].endswith(f"home.example.com at {HOME}"))
+        assert wait_until(lambda: p.status()["summary"].endswith(f"lab.example.com at {HOME}"))
         assert p.working and "linode-token" in login.asked
         st = p.status()
-        assert st["valid"] is True and table(st, "Dynamic DNS")["rows"][0][:2] == ["home.example.com", HOME]
-        assert [a["hook"] for a in st["actions"]] == ["refresh", "ddns_update"]
+        assert st["valid"] is True and table(st, "Dynamic DNS")["rows"][0][:2] == ["lab.example.com", HOME]
+        assert [a.get("hook") or a.get("form") for a in st["actions"]] == ["refresh", "ddns-now"]
     finally:
         p.detach()
     assert not p.working
     calls = len(fake.requests)
     time.sleep(0.2)
     assert len(fake.requests) == calls  # detached: nothing of it runs
+    env(settings_of(ddns="lab.example.com"))  # the process environment holds the token too
+    assert p.config(fresh=True).ready is False  # detached, no login lent: no settings read from the environment
+    p.login = login  # the platform lends its login again to ask a status
+    assert p.config(fresh=True).ready is True
+
+
+def test_the_charts_app_attaching_it_starts_nothing_nor_does_the_platform_with_nothing_set(made):
+    p, fake = made()
+    p.attach(Charts(), Pairs(settings_of(ddns="lab.example.com")))  # the charts app run alone attaches every plugin
+    try:
+        time.sleep(0.2)
+        assert not p.working and fake.requests == []
+    finally:
+        p.detach()
+    login = Pairs({})
+    p.attach(Platform(), login)  # under the platform, nothing set: no thread at all
+    try:
+        assert not p.working and fake.requests == []
+        login.pairs.update(Pairs(settings_of()).pairs)  # the token entered on the page
+        p.settings_changed()
+        assert p.working and wait_until(lambda: "/v4/profile" in fake.paths())
+    finally:
+        p.detach()
+    assert not p.working
+
+
+def test_a_refresh_once_detached_asks_nothing_and_keeps_nothing(made, env):
+    env(settings_of())
+    p, fake = made()
+    cfg = p.config(fresh=True)
+    p._rt.detached.set()  # what a detach sets first
+    assert p._refresh(cfg, p._rt.detached) == {"detached": True} and fake.requests == []
+    assert p._rt.api_ok is None and p._rt.read is None  # no outcome kept: the status is not made invalid by it
+
+
+def test_a_token_with_a_line_break_inside_is_never_sent_nor_shown(made, env):
+    env({"LINODE_TOKEN": TOKEN[:32] + "\n" + TOKEN[32:]})  # set outside the page: a wrapped paste
+    p, fake = made()
+    st = p.status()
+    assert st["valid"] is False and st["why"].startswith("LINODE_TOKEN holds a space or a line break inside")
+    with pytest.raises(ValueError, match="the API is not set up"):
+        p.refresh()
+    text = json.dumps([st, p.api_facts()])
+    assert fake.requests == [] and TOKEN[:32] not in text and TOKEN[32:] not in text
 
 
 def test_the_hooks_are_asked_by_name(made, env):
@@ -250,3 +308,9 @@ def test_the_command_line_reads_and_asks_yes_before_a_change(made, env):
     assert told[-1] == "refused: example.com has no A record at blog"
     said.clear()
     assert cli.main(["--json", "status"], plugin=p, out=said.append) == 0 and json.loads(said[0])["valid"] is True
+    env(settings_of(ddns="lab.example.com"))
+    p.settings_changed()
+    writes = len(fake.writes())
+    assert cli.main(["ddns"], plugin=p, out=said.append, err=told.append, ask=lambda q: "no") == 1
+    assert told[-1] == "nothing done" and len(fake.writes()) == writes  # a pass may write: asked first
+    assert cli.main(["ddns", "--yes"], plugin=p, out=said.append) == 0 and fake.writes()[-1][0] == "POST"

@@ -23,10 +23,12 @@ A machine plugin of the platform (`liminal_libs.machines.MachinePlugin`, plugin 
 - **Its API** on its page: what Linode's API is, its pages, every section of its reference and the calls the plugin
   makes (below).
 
-While it is attached to the platform app, it reads the account every quarter of an hour (about 20 requests, one more
-for each domain's records; the plans and their prices once a day) and checks the Dynamic DNS hosts every
-`LINODE_DDNS_MINUTES` (5), in a thread of its own. Detached (the platform ending, the plugin disabled or not valid),
-nothing of it runs. The page draws what it read last: no request is made to answer it.
+While it is attached to the platform app and its token is set, it reads the account every quarter of an hour (about 20
+requests, one more for each domain's records; the plans and their prices once a day) and checks the Dynamic DNS hosts
+every `LINODE_DDNS_MINUTES` (5), in a thread of its own. Attached by another app (the charts app run alone attaches every
+plugin it finds), with no token set, or detached (the platform ending, the plugin disabled or not valid), nothing of it
+runs; once detached, a pass under way writes nothing more and no setting is read. The page draws what it read last: no
+request is made to answer it.
 
 ## What it changes: free changes only, each confirmed
 
@@ -37,7 +39,9 @@ nothing of it runs. The page draws what it read last: no request is made to answ
 | **Remove** on a record | `DELETE /v4/domains/{domainId}/records/{recordId}` |
 | **Add a rule…** under a firewall's rules, **Remove** on a rule | `PUT /v4/networking/firewalls/{firewallId}/rules`: the whole set, every other rule and both policies as read |
 | **Add an SSH key…**, **Remove** on a key | `POST /v4/profile/sshkeys` ({label, ssh_key}), `DELETE /v4/profile/sshkeys/{sshKeyId}` |
-| **Refresh**, **Update DNS now** | reads; the Dynamic DNS hosts' A records set |
+| **Take over…** on a Dynamic DNS host holding another address | that host's A record set to this network's address, once confirmed (below) |
+| **Refresh** | reads only |
+| **Update DNS now** | the Dynamic DNS hosts of its own set now, once confirmed |
 
 Nothing is sent until you confirm the change: the confirmation names it (the Linode, the record, the rule, the key) and
 what is kept. The answer says what was done and what was read back after it.
@@ -58,10 +62,14 @@ what is kept. The answer says what was done and what was read back after it.
   answers is checked too: one more than the one read, else another change landed in between, and the report says so
   with the rules as they were. Rules holding a field this plugin does not know are not written (their table says why).
   An added rule goes after its direction's others (the first rule that matches decides, else the policy).
-- **Risky rule changes are asked twice**: an inbound rule that opens SSH (22) or every port to the whole internet
-  (0.0.0.0/0, ::/0) where the rules did not let it in, and a change that ends SSH, from where a rule let it in, to a
-  Linode the firewall guards (the rule removed, or a DROP added). The first confirmation is refused, naming the risk;
-  the page then asks "Change the firewall anyway?" and writes only on that second yes.
+- **Risky rule changes are asked twice**, whatever rule a change adds or removes: each is weighed by the inbound policy
+  and the rules left, before and after it. Risky: a change that lets the whole internet (0.0.0.0/0, ::/0) reach every
+  TCP or UDP port, or SSH, RDP, Telnet, SMB, VNC, Docker, the Kubernetes API or a database's port (MySQL, PostgreSQL,
+  SQL Server, MongoDB, Redis, Elasticsearch, memcached), where it did not before: an ACCEPT added, or a DROP removed
+  (removing a DROP that kept SSH shut was asked once in 0.1.0). And a change that ends SSH, from where the rules let it
+  in, to a Linode the firewall guards: an ACCEPT removed, or a DROP added. The first confirmation is refused, naming the
+  risk; the page then asks "Change the firewall anyway?" and writes only on that second yes (the hook's `accept_risk`,
+  honoured only when it is exactly `true`). A web port opened to everyone (80, 443) is asked once.
 - **An SSH key** is a public key (the .pub file's line, its kind one Linode takes: ssh-ed25519, ssh-rsa,
   ecdsa-sha2-nistp256/384/521, sk-ecdsa-sha2-nistp256, ssh-dss); a private key pasted by mistake is refused and never
   sent. The profile's keys are for the Linodes you deploy (Linode's reference: a key lets you in as their root user);
@@ -86,14 +94,16 @@ them. No firewall is made, deleted, disabled or attached here, and no domain is 
    | Linodes | Read/Write | `linodes:read_write` | boot, shut down, reboot (and the Linodes and placement groups read) |
    | Domains | Read/Write | `domains:read_write` | records set and removed, Dynamic DNS |
    | Firewalls | Read/Write | `firewall:read_write` | rules added and removed |
-   | Account | Read/Write | `account:read_write` | the profile's SSH keys added and removed |
+   | Account | Read Only | `account:read_only` | the balance, the transfer pool and the profile's SSH keys shown |
    | Volumes, IPs, Images, Kubernetes, NodeBalancers, Databases, Object Storage, VPCs | Read Only | `volumes:read_only`, `ips:read_only`, `images:read_only`, `lke:read_only`, `nodebalancers:read_only`, `databases:read_only`, `object_storage:read_only`, `vpc:read_only` | shown and counted |
    | Events, Longview, StackScripts | No Access | | never asked |
 
-   Linode names no scope of the profile's own for SSH keys: its reference gives `account:read_write` for adding and
-   removing them, which also lets the token change the account's contact and billing details. If you would rather not,
-   give Account **Read Only**: the SSH keys are then shown but their Add and Remove are refused by Linode (the page
-   says so). An area left at No Access is shown as not allowed by the token, beside the rest.
+   **Only if you want the profile's SSH keys added and removed here**: Account **Read/Write** (`account:read_write`).
+   Linode names no scope of the profile's own for SSH keys, and the one its reference gives also lets a token make
+   payments, add users and cancel the account, none of which the plugin ever asks; so Read Only is the default here.
+   With it, the SSH keys are shown and their Add and Remove are refused by Linode (the page says so). An area left at
+   No Access is shown as not allowed by the token, beside the rest. A token holding a space or a line break inside (a
+   wrapped paste through setx or the registry) is refused: never sent, never shown.
 2. **Dynamic DNS** (optional): add each host's domain to DNS Manager (Domains > Create Domain) and point the domain's
    name servers at Linode's. DNS Manager serves a domain's records only while the account has at least one active Linode
    (its guide); the plugin says so when none is running.
@@ -114,12 +124,25 @@ The plugin keeps no settings file and never shows a value: its status names the 
 ## Dynamic DNS
 
 This network's public IPv4 address is asked of DNS (`myip.opendns.com` of OpenDNS's resolver, else Google's
-`o-o.myaddr.l.google.com`, each asked of the name server by its IPv4 address), then each host's A record is read from
-its domain's records (one read a domain a pass) and set where it differs: the one A record changed (its TTL kept), or
-one made with a TTL of 300 seconds (the least Linode takes, so a change is seen soon). A host holding several A records
-is left as it is and said. Update DNS now sets every host's record. The reference's `[remote_addr]` target is not used:
-the plugin sends the address it found, so the record is this network's IPv4 address even when the request goes out over
-IPv6. A host in no master domain of the account (a slave's, another provider's) is named as such.
+`o-o.myaddr.l.google.com`, each asked of the name server by its IPv4 address), then each host's records are read from
+its domain's (one read a domain a pass). Dynamic DNS changes only what is its own (liminal-libs 1.49.2's keeper, after
+an audit found 0.1.0 pointed a listed host's live record at home within a minute, unasked):
+
+- a host with no A record: one is made, with a TTL of 300 seconds (the least Linode takes, so a change is seen soon);
+- a host already pointing at this network, or at the address the keeper set there last: kept current, its A record
+  changed when the network's address moves (its TTL kept), after a restart too (what is its own is kept in the
+  platform's folder, `linode/ddns.json`);
+- a host holding another address, or several: **left as it is**, its row saying what it holds, with a **Take over…**
+  whose confirmation says what it holds and that it will point here instead. Once taken over, its A record is set to
+  this network's address (several are never cut to one unasked; taken over, one is kept, the others removed);
+- a host that is a CNAME gets no A record beside it (DNS Manager's own set refuses that): it is said and left as it is.
+  A host's AAAA records are not Dynamic DNS's: they are left as they are.
+
+Update DNS now (confirmed) sets each host of its own whether it differs or not. The address is asked again just before a
+write: a stale one is never written back. A host taken out of `LINODE_DDNS_HOSTS` is let go, so one listed again later
+is asked about again. The reference's `[remote_addr]` target is not used: the plugin sends the address it found, so the
+record is this network's IPv4 address even when the request goes out over IPv6. A host in no master domain of the
+account (a slave's, another provider's) is named as such.
 
 ## Valid, and the platform
 
@@ -163,8 +186,10 @@ the areas the token may not read.
 `remove_record(domain, record, name=None, rtype=None, target=None)`,
 `add_rule(firewall, seen, direction, action, protocol, ports=None, addresses=None, label=None, description=None, accept_risk=False)`,
 `remove_rule(firewall, seen, direction, position, rule=None, accept_risk=False)`, `add_ssh_key(label, ssh_key)`,
-`remove_ssh_key(key, label=None)`, `ddns_update(force=True)`. A change's report: `said`, `lines` (its words), `ok`,
-`changed`.
+`remove_ssh_key(key, label=None)`, `ddns_update(force=True)`, `ddns_take_over(host, holds=None)`. A change's report:
+`said`, `lines` (its words), `ok`, `changed`. What the page showed is needed, so nothing is changed unseen: a record's
+host, type and target to remove it, the rules' fingerprint (`seen`) to change them and a rule's words to remove it, a
+key's label (`""` for none) to remove it; `accept_risk` counts only when it is exactly `true`.
 
 ## From the command line
 
@@ -178,7 +203,7 @@ python -m plugin_platform_linode domains
 python -m plugin_platform_linode records example.com
 python -m plugin_platform_linode firewalls
 python -m plugin_platform_linode keys
-python -m plugin_platform_linode ddns [--now]
+python -m plugin_platform_linode ddns [--now]          (asks yes: a pass may write)
 python -m plugin_platform_linode power web-1 off
 python -m plugin_platform_linode set example.com home A 203.0.113.7 --ttl 300
 python -m plugin_platform_linode set example.com @ TXT "google-site-verification=..."

@@ -90,13 +90,34 @@ def test_the_rules_apply_in_order_and_the_policy_decides_the_rest():
     assert fw.every_port({"protocol": "TCP", "ports": "1-65535"}) and not fw.every_port(WEB)
 
 
-def test_what_a_rule_opens_and_which_ssh_a_change_ends():
-    rules = rules_of([SSH_HOME])
+def with_inbound(rules: dict, *inbound) -> dict:
+    return {**rules, "inbound": list(inbound)}
+
+
+def test_what_a_change_opens_to_the_whole_internet_is_weighed_before_and_after_it():
+    home = rules_of([SSH_HOME])  # policy DROP: the internet reaches nothing
+    assert fw.exposed(home) == []
     wide = fw.rule_of("ACCEPT", "TCP", "22", "0.0.0.0/0")
-    assert fw.opens(rules, wide) == ["SSH (22)"] and fw.opens(rules_of([SSH_ALL]), wide) == []  # open already: nothing
-    assert fw.opens(rules, fw.rule_of("ACCEPT", "ALL", None, "::/0")) == ["every port", "SSH (22)"]
-    assert fw.opens(rules_of([SSH_HOME], inbound_policy="ACCEPT"), fw.rule_of("ACCEPT", "UDP", None, "0.0.0.0/0")) == []
-    assert fw.opens(rules, fw.rule_of("ACCEPT", "TCP", "22", "198.51.100.0/24")) == []  # not the whole internet
+    assert fw.opened(home, with_inbound(home, SSH_HOME, wide)) == ["SSH (22)"]
+    assert fw.opened(rules_of([SSH_ALL]), with_inbound(rules_of([SSH_ALL]), SSH_ALL, wide)) == []  # open already: nothing
+    every = fw.opened(home, with_inbound(home, SSH_HOME, fw.rule_of("ACCEPT", "ALL", None, "::/0")))
+    assert every[:3] == ["every TCP port", "every UDP port", "SSH (22)"] and "RDP (3389)" in every
+    assert fw.opened_words(every) == "every TCP port (SSH among them) and every UDP port"
+    assert fw.opened(home, with_inbound(home, SSH_HOME, fw.rule_of("ACCEPT", "TCP", "1-65535", "0.0.0.0/0")))[0] == \
+        "every TCP port"  # every port named by a rule is every port too
+    assert fw.opened(home, with_inbound(home, SSH_HOME, fw.rule_of("ACCEPT", "TCP", "22", "198.51.100.0/24"))) == []
+    # the ports servers are broken into through: RDP, Docker, a database (the audit: asked once before); a web port is not
+    for port, words in (("3389", "RDP (3389)"), ("2375", "Docker (2375)"), ("3306", "MySQL (3306)"), ("27017", "MongoDB (27017)")):
+        assert fw.opened(home, with_inbound(home, SSH_HOME, fw.rule_of("ACCEPT", "TCP", port, "0.0.0.0/0"))) == [words]
+    assert fw.opened(home, with_inbound(home, SSH_HOME, fw.rule_of("ACCEPT", "TCP", "80, 443", "0.0.0.0/0, ::/0"))) == []
+    # removing a DROP opens what it kept closed (the audit's two cases), weighed by the policy and the rules left
+    drop22 = fw.rule_of("DROP", "TCP", "22", "0.0.0.0/0, ::/0")
+    allow_all = fw.rule_of("ACCEPT", "ALL", None, "0.0.0.0/0, ::/0")
+    shut = rules_of([drop22], inbound_policy="ACCEPT")
+    assert fw.opened(shut, with_inbound(shut)) == ["every TCP port", "SSH (22)"]
+    shut = rules_of([drop22, allow_all])
+    assert fw.opened(shut, with_inbound(shut, allow_all)) == ["every TCP port", "SSH (22)"]
+    assert fw.opened(shut, with_inbound(shut, drop22, allow_all, wide)) == []  # the DROP still first: nothing more
     probes = fw.nets_of(SSH_HOME)
     assert fw.ssh_lost([SSH_HOME], [], "DROP", probes) == ["203.0.113.7/32"]
     assert fw.ssh_lost([SSH_HOME], [], "ACCEPT", probes) == []  # the policy lets it in still
@@ -111,11 +132,21 @@ def test_a_removal_names_its_rule_and_refuses_one_that_moved():
     with pytest.raises(Refusal, match="the rules changed since they were read"):
         fw.plan_remove(rules, "inbound", 1, f, "web-fw", "ACCEPT TCP 80, 443 from 0.0.0.0/0, ::/0 (web)")
     with pytest.raises(Refusal, match="has no inbound rule 3"):
-        fw.plan_remove(rules, "inbound", 3, f, "web-fw")
-    new, _, risk = fw.plan_remove(rules, "inbound", 1, f, "web-fw")
-    assert risk and "lets SSH (22) in from 0.0.0.0/0, ::/0 to web-1" in risk
-    new, _, risk = fw.plan_remove(rules, "inbound", 1, {**f, "entities": []}, "web-fw")
+        fw.plan_remove(rules, "inbound", 3, f, "web-fw", "ACCEPT TCP 22 from 0.0.0.0/0, ::/0 (ssh)")
+    with pytest.raises(ValueError, match="name the rule as it was shown"):
+        fw.plan_remove(rules, "inbound", 1, f, "web-fw")  # what was shown is needed
+    ssh = fw.words(SSH_ALL)
+    new, _, risk = fw.plan_remove(rules, "inbound", 1, f, "web-fw", ssh)
+    assert risk == ("the change ends SSH (22) from 0.0.0.0/0, ::/0 to web-1, which web-fw let in: you may lock yourself "
+                    "out of them")
+    new, _, risk = fw.plan_remove(rules, "inbound", 1, {**f, "entities": []}, "web-fw", ssh)
     assert risk is None  # it guards no Linode: no SSH to lose
+    # a DROP removed: what it kept closed is opened, said whatever the rule
+    shut = rules_of([fw.rule_of("DROP", "TCP", "22", "0.0.0.0/0, ::/0")], inbound_policy="ACCEPT")
+    _, _, risk = fw.plan_remove(shut, "inbound", 1, f, "web-fw", "DROP TCP 22 from 0.0.0.0/0, ::/0")
+    assert risk == "the change opens every TCP port (SSH among them) to the whole internet on web-fw (it guards web-1)"
+    _, _, risk = fw.plan_remove(shut, "inbound", 1, {**f, "status": "disabled"}, "web-fw", "DROP TCP 22 from 0.0.0.0/0, ::/0")
+    assert risk.endswith("(web-fw is disabled now: so once it is enabled)")
     full = rules_of([WEB] * 25)
     with pytest.raises(Refusal, match="at most 25"):
         fw.plan_add(full, "outbound", fw.rule_of("DROP", "TCP", "25", "0.0.0.0/0"), f, "web-fw")

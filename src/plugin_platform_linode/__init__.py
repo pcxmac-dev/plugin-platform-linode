@@ -19,7 +19,8 @@ app, or detached, nothing of it runs, and once detached no setting is read. Its 
 is made to answer it): the platform's page draws its tables, its actions (Refresh, Update DNS now) and its forms, and its
 API card (card.py: plugin API 2.2).
 
-0.1.1 (2026-11-11) is what an audit of the cloud plugins found before any key went in: see CHANGELOG.md.
+0.1.1 and 0.1.2 (2026-11-11) are what an audit of the cloud plugins and its re-verification found before any key went
+in: see CHANGELOG.md.
 
     python -m plugin_platform_linode status | servers | domains | records DOMAIN | ddns [--now] | firewalls | keys
         | power LINODE on|off|reboot | set DOMAIN HOST TYPE TARGET [--ttl N] [--priority N] [--tag T]
@@ -31,7 +32,6 @@ import base64
 import binascii
 import hashlib
 import ipaddress
-import json
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -50,7 +50,7 @@ from .ddns import PUBLIC_IPV4, LinodeDns, state_path
 from .refusal import Refusal
 from .settings import ACCESS_SHORT, DDNS_HOSTS, KEYS, NAMES, SCOPE_WORDS, TOKEN, TOKEN_PAGE, Config
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 REFRESH_S = 900.0  # the account read again at most this often while attached (or by Refresh)
 CONFIG_S = 30.0  # the settings asked of the login again after this long
 RETRY_S = 900.0  # a read that failed is taken as untried after this long while detached: attached again, it is tried again
@@ -212,7 +212,6 @@ class _Runtime:
         self.ddns_at: float | None = None
         self.keeper: Keeper | None = None
         self.dns: LinodeDns | None = None
-        self.ddns_known: set[str] | None = None  # the hosts the keeper may hold as its own (let go once out of the settings)
         self.detached = threading.Event()  # set by a detach: a pass under way writes nothing more, no settings are read
         self.worker: threading.Thread | None = None
         self.stop: threading.Event | None = None
@@ -436,6 +435,8 @@ class LinodePlugin(MachinePlugin):
         with self._rt.lock:
             self._rt.read, self._rt.refreshed_at = read, now
             self._rt.api_ok, self._rt.api_error, self._rt.api_error_at, self._rt.api_print = True, "", None, cfg.api_print
+        if isinstance(read["domains"], list) and not (stop is not None and stop.is_set()):
+            self._settle(cfg)
         linodes = read["linodes"] if isinstance(read["linodes"], list) else []
         domains = read["domains"] if isinstance(read["domains"], list) else []
         return {"linodes": len(linodes), "domains": len(domains),
@@ -730,10 +731,12 @@ class LinodePlugin(MachinePlugin):
             raise ValueError(f"Dynamic DNS is not set up: {DDNS_HOSTS} and {TOKEN}")
         return self._ddns_pass(cfg, bool(force))
 
-    def ddns_take_over(self, host, holds=None) -> list[dict]:
-        """A host of LINODE_DDNS_HOSTS that holds another address taken over (the page's Take over…, once confirmed:
-        liminal-libs 1.49.2's take_over), then a pass for that host, which points its A record at this network's address.
-        `holds`: what the page showed it holding; holding something else now, it is refused and nothing is taken over."""
+    def ddns_take_over(self, host, holds=None, accept_take_over=False) -> list[dict]:
+        """A host of LINODE_DDNS_HOSTS that holds another address taken over (the page's Take over…, confirmed twice:
+        liminal-libs 1.49.7's take_over, refused with TakeOverRefused unless `accept_take_over` is exactly true, which the
+        page asks as its second confirmation), then a pass for that host, which points its A record at this network's
+        address. `holds`: what the page showed it holding; holding something else now, it is refused and nothing is
+        taken over."""
         cfg = self.config(fresh=True)
         if not cfg.ddns_ready:
             raise ValueError(f"Dynamic DNS is not set up: {DDNS_HOSTS} and {TOKEN}")
@@ -745,14 +748,14 @@ class LinodePlugin(MachinePlugin):
         if h is None:
             raise ValueError(f"{host} is not one of {DDNS_HOSTS} in a master domain of this account's DNS Manager")
         k = self.keeper()
+        self._rt.dns.begin()
+        now = self._rt.dns.read(h)  # what it holds, read afresh: said by the second confirmation's refusal
         if holds is not None:
-            self._rt.dns.begin()
-            now = self._rt.dns.read(h)
             shown = [a.strip() for a in str(holds).split(",") if a.strip()]
             if sorted(now) != sorted(shown):
                 raise Refusal(f"{h.fqdn} holds {', '.join(now) or 'no A record'} now, not {holds or 'nothing'}: look at it "
                               "again; nothing is taken over")
-        k.take_over(h.fqdn)
+        k.take_over(h.fqdn, accept=accept_take_over, holds=", ".join(now))  # TakeOverRefused unless exactly true
         return self._ddns_pass(cfg, force=False, only={h.fqdn})
 
     def _ddns_pass(self, cfg: Config, force: bool, wait: float = 120.0, stop: threading.Event | None = None,
@@ -766,7 +769,7 @@ class LinodePlugin(MachinePlugin):
             self.domains()  # the zones it may keep hosts in: read once
         hosts, _ = hosts_of(cfg.hosts, [d.get("domain") for d in self._masters() or []])
         k = self.keeper()
-        self._let_go(cfg, k)
+        self._settle(cfg)
         if only is not None:
             hosts = [h for h in hosts if h.fqdn in only]
         out = k.run_pass(hosts, force=force, wait=wait, stop=stop)
@@ -774,23 +777,14 @@ class LinodePlugin(MachinePlugin):
             self._rt.ddns_print, self._rt.ddns_at = cfg.ddns_print, self._clock()
         return out
 
-    def _let_go(self, cfg: Config, k: Keeper) -> None:
-        """The hosts taken out of LINODE_DDNS_HOSTS let go (the keeper's let_go: neither its own nor taken over any more,
-        so one listed again later is asked about again); the first time, the ones its state file holds."""
-        typed = {typed_host(x) for x in cfg.hosts.replace(";", ",").replace(" ", ",").split(",") if x.strip()}
-        with self._rt.lock:
-            known = self._rt.ddns_known
-        if known is None:
-            known = set()
-            try:
-                data = json.loads(state_path().read_text(encoding="utf-8"))
-                known = {str(x).lower() for x in [*(data.get("own") or {}), *(data.get("taken") or [])]}
-            except (OSError, ValueError, AttributeError, TypeError):
-                pass
-        for fqdn in sorted(known - typed):
-            k.let_go(fqdn)
-        with self._rt.lock:
-            self._rt.ddns_known = typed
+    def _settle(self, cfg: Config) -> None:
+        """The keeper's hosts that are not in the whole Dynamic DNS setting let go (liminal-libs 1.49.7's settle), so one
+        taken out of it, while the plugin ran or not, comes back as not its own: asked about again. Only once the
+        account's domains are read (never on a list the unread zones would cut short), with the setting whole, even empty
+        (every host taken out)."""
+        if self._masters() is None:
+            return
+        self.keeper().settle([typed_host(x) for x in cfg.hosts.replace(";", ",").replace(" ", ",").split(",") if x.strip()])
 
     # -- attached: the reading in the background ----------------------------------------------------------------------------
     def attach(self, app, login=None) -> dict:

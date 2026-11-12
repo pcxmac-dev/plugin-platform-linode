@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.2 (2026-11-11)
+
+What the re-verification of the audit's fixes found (the other session re-checked 0.1.1). Needs liminal-libs>=1.49.7.
+
+- **The firewall risk check tells IPv4 from IPv6 again**: 0.1.1 merged what the whole internet reaches across the two
+  families, so opening SSH, or every port, to all of IPv4 (0.0.0.0/0 alone) where IPv6 was open already, or the other way
+  round, or removing a DROP that kept one family shut under an ACCEPT policy, was asked once. Each family is judged on
+  its own now, and the words say to whom: "to all of IPv4 (0.0.0.0/0)", "to all of IPv6 (::/0)", or "to the whole
+  internet" when a change opens both. Tests take each family on its own.
+- **Take over… is asked twice** (liminal-libs 1.49.7): it sets the record at once and drops every address it holds, so
+  `ddns_take_over(host, holds, accept_take_over)` is refused (`TakeOverRefused`, naming `accept_take_over`) until the
+  page's second confirmation ("Drop what it holds?") sends it exactly true; the checks before it stay (the host is in
+  the setting, its record still holds what the page showed).
+- **A host taken out of the setting is let go, while the plugin ran or not**: the keeper is settled (`Keeper.settle`)
+  with the whole LINODE_DDNS_HOSTS setting, even empty, in each refresh and each pass once the account's domains are
+  read; put back later, a host holding another address is left as it is, its row offering Take over… again. (0.1.1's
+  own let-go of removed hosts is replaced by it.)
+
 ## 0.1.1 (2026-11-11)
 
 What an audit of the cloud plugins found before any key went in (session 87405e6a: eight reviewers, a skeptic per

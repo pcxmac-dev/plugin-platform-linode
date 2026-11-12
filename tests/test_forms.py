@@ -273,6 +273,31 @@ def test_removing_a_drop_rule_that_kept_ssh_shut_is_asked_twice(ready):
     assert rep["ok"] and fake.writes()[-1][2]["inbound"] == [allow_all]
 
 
+@pytest.mark.parametrize("open_already, opened, family, whole", [
+    ("::/0", "0.0.0.0/0", "IPv4", "0.0.0.0/0"),  # all of IPv4 opened, IPv6 open already
+    ("0.0.0.0/0", "::/0", "IPv6", "::/0"),  # all of IPv6 opened, IPv4 open already
+    ("203.0.113.7/32", "0.0.0.0/0", "IPv4", "0.0.0.0/0"),  # all of IPv4 alone opened on a shut firewall
+    ("203.0.113.7/32", "::/0", "IPv6", "::/0"),  # all of IPv6 alone opened on a shut firewall
+])
+def test_opening_ssh_or_every_port_to_one_family_alone_is_asked_twice(ready, open_already, opened, family, whole):
+    """The re-verification: 0.1.1 merged IPv4 and IPv6, so opening one family where the other was open already went on
+    one confirmation. Each family is judged on its own now, through the page's own form."""
+    p, fake = ready
+    fake.firewalls[1]["rules"] = rules_of([{"action": "ACCEPT", "protocol": "ALL",
+                                            "addresses": {"ipv4" if "." in open_already else "ipv6": [open_already]}}],
+                                          version=5)
+    p.refresh()
+    form = forms_of(p.status())["rule-add:8"]
+    for protocol, ports, words in (("TCP", "22", "SSH (22)"), ("ALL", "", "every TCP port (SSH among them) and every UDP port")):
+        values = {"direction": "inbound", "action": "ACCEPT", "protocol": protocol, "ports": ports, "addresses": opened}
+        with pytest.raises(Refusal) as refused:
+            p.ask(form["hook"], *page_args(form, values))
+        assert refused.value.accept == ACCEPT_RISK and fake.writes() == []
+        assert str(refused.value).startswith(f"the change opens {words} to all of {family} ({whole}) on db-fw (it guards db-1)")
+    rep = p.ask(form["hook"], *page_args(form, values, accepted={ACCEPT_RISK}))  # the second yes: written
+    assert rep["ok"] and fake.writes()[-1][1] == "/v4/networking/firewalls/8/rules"
+
+
 def test_the_second_confirmation_counts_only_when_exactly_true(ready):
     """accept_risk is honoured only when it is True (the page sends JSON true): a string, a 1 or anything else from a
     local program is refused like no accept at all."""

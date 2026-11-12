@@ -63,10 +63,11 @@ what is kept. The answer says what was done and what was read back after it.
   with the rules as they were. Rules holding a field this plugin does not know are not written (their table says why).
   An added rule goes after its direction's others (the first rule that matches decides, else the policy).
 - **Risky rule changes are asked twice**, whatever rule a change adds or removes: each is weighed by the inbound policy
-  and the rules left, before and after it. Risky: a change that lets the whole internet (0.0.0.0/0, ::/0) reach every
-  TCP or UDP port, or SSH, RDP, Telnet, SMB, VNC, Docker, the Kubernetes API or a database's port (MySQL, PostgreSQL,
-  SQL Server, MongoDB, Redis, Elasticsearch, memcached), where it did not before: an ACCEPT added, or a DROP removed
-  (removing a DROP that kept SSH shut was asked once in 0.1.0). And a change that ends SSH, from where the rules let it
+  and the rules left, before and after it, all of IPv4 (0.0.0.0/0) and all of IPv6 (::/0) each judged on its own.
+  Risky: a change that lets either reach every TCP or UDP port, or SSH, RDP, Telnet, SMB, VNC, Docker, the Kubernetes
+  API or a database's port (MySQL, PostgreSQL, SQL Server, MongoDB, Redis, Elasticsearch, memcached), where it did not
+  before: an ACCEPT added, or a DROP removed (removing a DROP that kept SSH shut was asked once in 0.1.0; opening one
+  family where the other was open already, once in 0.1.1). And a change that ends SSH, from where the rules let it
   in, to a Linode the firewall guards: an ACCEPT removed, or a DROP added. The first confirmation is refused, naming the
   risk; the page then asks "Change the firewall anyway?" and writes only on that second yes (the hook's `accept_risk`,
   honoured only when it is exactly `true`). A web port opened to everyone (80, 443) is asked once.
@@ -133,14 +134,16 @@ an audit found 0.1.0 pointed a listed host's live record at home within a minute
   changed when the network's address moves (its TTL kept), after a restart too (what is its own is kept in the
   platform's folder, `linode/ddns.json`);
 - a host holding another address, or several: **left as it is**, its row saying what it holds, with a **Take over…**
-  whose confirmation says what it holds and that it will point here instead. Once taken over, its A record is set to
-  this network's address (several are never cut to one unasked; taken over, one is kept, the others removed);
+  asked twice (its confirmation says what it holds and that it will point here instead; the second, "Drop what it
+  holds?", that it is set at once and every address it holds is dropped). Once taken over, its A record is set to this
+  network's address (several are never cut to one unasked; taken over, one is kept, the others removed);
 - a host that is a CNAME gets no A record beside it (DNS Manager's own set refuses that): it is said and left as it is.
   A host's AAAA records are not Dynamic DNS's: they are left as they are.
 
 Update DNS now (confirmed) sets each host of its own whether it differs or not. The address is asked again just before a
-write: a stale one is never written back. A host taken out of `LINODE_DDNS_HOSTS` is let go, so one listed again later
-is asked about again. The reference's `[remote_addr]` target is not used: the plugin sends the address it found, so the
+write: a stale one is never written back. A host taken out of `LINODE_DDNS_HOSTS`, while the platform ran or not, is let
+go by the next refresh or pass once the account's domains are read (the keeper settled with the whole setting), so one
+listed again later is left as it is and offered Take over… again. The reference's `[remote_addr]` target is not used: the plugin sends the address it found, so the
 record is this network's IPv4 address even when the request goes out over IPv6. A host in no master domain of the
 account (a slave's, another provider's) is named as such.
 
@@ -186,10 +189,11 @@ the areas the token may not read.
 `remove_record(domain, record, name=None, rtype=None, target=None)`,
 `add_rule(firewall, seen, direction, action, protocol, ports=None, addresses=None, label=None, description=None, accept_risk=False)`,
 `remove_rule(firewall, seen, direction, position, rule=None, accept_risk=False)`, `add_ssh_key(label, ssh_key)`,
-`remove_ssh_key(key, label=None)`, `ddns_update(force=True)`, `ddns_take_over(host, holds=None)`. A change's report:
+`remove_ssh_key(key, label=None)`, `ddns_update(force=True)`, `ddns_take_over(host, holds=None, accept_take_over=False)`.
+A change's report:
 `said`, `lines` (its words), `ok`, `changed`. What the page showed is needed, so nothing is changed unseen: a record's
 host, type and target to remove it, the rules' fingerprint (`seen`) to change them and a rule's words to remove it, a
-key's label (`""` for none) to remove it; `accept_risk` counts only when it is exactly `true`.
+key's label (`""` for none) to remove it; `accept_risk` and `accept_take_over` count only when exactly `true`.
 
 ## From the command line
 

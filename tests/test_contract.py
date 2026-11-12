@@ -25,7 +25,7 @@ def test_every_plugin_here_conforms_to_the_class_contract():
     assert [p.name for p in found] == ["linode"] and all(p.api == "2.2" and not p.is_record for p in found)
     assert {p.SYSTEM for p in found} == {"platform"} and {p.KIND for p in found} == {"machine"}
     (p,) = found
-    assert (p.title, p.order, p.ICON, p.version, module.__version__) == ("Linode", 761, "linode", "0.1.1", "0.1.1")
+    assert (p.title, p.order, p.ICON, p.version, module.__version__) == ("Linode", 761, "linode", "0.1.2", "0.1.2")
     assert [a.name for a in p.apis] == ["Linode API v4"] and p.interface()["apis"] == ["Linode API v4"]
 
 
@@ -89,7 +89,7 @@ def test_every_request_a_full_run_makes_is_one_the_card_names(made, env):
     p, fake = made(fake)
     p.refresh()
     p.ddns_update(force=False)
-    p.ddns_take_over("home.example.com", "198.51.100.7, 198.51.100.8")  # one A record kept: the other's DELETE
+    p.ddns_take_over("home.example.com", "198.51.100.7, 198.51.100.8", True)  # one A record kept: the other's DELETE
     st = p.status()
     forms = forms_of(st)
     web = table(st, "Linodes")["rows"][1]

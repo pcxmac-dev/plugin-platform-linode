@@ -94,34 +94,70 @@ def with_inbound(rules: dict, *inbound) -> dict:
     return {**rules, "inbound": list(inbound)}
 
 
+V4, V6 = "IPv4", "IPv6"
+
+
 def test_what_a_change_opens_to_the_whole_internet_is_weighed_before_and_after_it():
     home = rules_of([SSH_HOME])  # policy DROP: the internet reaches nothing
     assert fw.exposed(home) == []
-    wide = fw.rule_of("ACCEPT", "TCP", "22", "0.0.0.0/0")
-    assert fw.opened(home, with_inbound(home, SSH_HOME, wide)) == ["SSH (22)"]
+    wide = fw.rule_of("ACCEPT", "TCP", "22", "0.0.0.0/0, ::/0")
+    assert fw.opened(home, with_inbound(home, SSH_HOME, wide)) == [("SSH (22)", V4), ("SSH (22)", V6)]
+    assert fw.opened_words([("SSH (22)", V4), ("SSH (22)", V6)]) == "SSH (22) to the whole internet"
     assert fw.opened(rules_of([SSH_ALL]), with_inbound(rules_of([SSH_ALL]), SSH_ALL, wide)) == []  # open already: nothing
     every = fw.opened(home, with_inbound(home, SSH_HOME, fw.rule_of("ACCEPT", "ALL", None, "::/0")))
-    assert every[:3] == ["every TCP port", "every UDP port", "SSH (22)"] and "RDP (3389)" in every
-    assert fw.opened_words(every) == "every TCP port (SSH among them) and every UDP port"
+    assert every[:3] == [("every TCP port", V6), ("every UDP port", V6), ("SSH (22)", V6)] and ("RDP (3389)", V6) in every
+    assert all(family == V6 for _, family in every)
+    assert fw.opened_words(every) == "every TCP port (SSH among them) and every UDP port to all of IPv6 (::/0)"
     assert fw.opened(home, with_inbound(home, SSH_HOME, fw.rule_of("ACCEPT", "TCP", "1-65535", "0.0.0.0/0")))[0] == \
-        "every TCP port"  # every port named by a rule is every port too
+        ("every TCP port", V4)  # every port named by a rule is every port too
     assert fw.opened(home, with_inbound(home, SSH_HOME, fw.rule_of("ACCEPT", "TCP", "22", "198.51.100.0/24"))) == []
     # the ports servers are broken into through: RDP, Docker, a database (the audit: asked once before); a web port is not
     for port, words in (("3389", "RDP (3389)"), ("2375", "Docker (2375)"), ("3306", "MySQL (3306)"), ("27017", "MongoDB (27017)")):
-        assert fw.opened(home, with_inbound(home, SSH_HOME, fw.rule_of("ACCEPT", "TCP", port, "0.0.0.0/0"))) == [words]
+        assert fw.opened(home, with_inbound(home, SSH_HOME, fw.rule_of("ACCEPT", "TCP", port, "0.0.0.0/0"))) == [(words, V4)]
     assert fw.opened(home, with_inbound(home, SSH_HOME, fw.rule_of("ACCEPT", "TCP", "80, 443", "0.0.0.0/0, ::/0"))) == []
     # removing a DROP opens what it kept closed (the audit's two cases), weighed by the policy and the rules left
     drop22 = fw.rule_of("DROP", "TCP", "22", "0.0.0.0/0, ::/0")
     allow_all = fw.rule_of("ACCEPT", "ALL", None, "0.0.0.0/0, ::/0")
+    both = [("every TCP port", V4), ("SSH (22)", V4), ("every TCP port", V6), ("SSH (22)", V6)]
     shut = rules_of([drop22], inbound_policy="ACCEPT")
-    assert fw.opened(shut, with_inbound(shut)) == ["every TCP port", "SSH (22)"]
+    assert fw.opened(shut, with_inbound(shut)) == both
     shut = rules_of([drop22, allow_all])
-    assert fw.opened(shut, with_inbound(shut, allow_all)) == ["every TCP port", "SSH (22)"]
+    assert fw.opened(shut, with_inbound(shut, allow_all)) == both
     assert fw.opened(shut, with_inbound(shut, drop22, allow_all, wide)) == []  # the DROP still first: nothing more
     probes = fw.nets_of(SSH_HOME)
     assert fw.ssh_lost([SSH_HOME], [], "DROP", probes) == ["203.0.113.7/32"]
     assert fw.ssh_lost([SSH_HOME], [], "ACCEPT", probes) == []  # the policy lets it in still
     assert fw.ssh_lost([SSH_HOME, SSH_ALL], [SSH_ALL], "DROP", probes) == []  # another rule lets it in still
+
+
+def test_each_family_is_judged_on_its_own():
+    """All of IPv4 (0.0.0.0/0) and all of IPv6 (::/0) are told apart (the re-verification: 0.1.1 merged them, so opening
+    one family where the other was open already was asked once)."""
+    f = {"id": 8, "label": "db-fw", "status": "enabled", "entities": [{"id": 12, "label": "db-1", "type": "linode"}]}
+    ssh4, ssh6 = fw.rule_of("ACCEPT", "TCP", "22", "0.0.0.0/0"), fw.rule_of("ACCEPT", "TCP", "22", "::/0")
+    all4, all6 = fw.rule_of("ACCEPT", "ALL", None, "0.0.0.0/0"), fw.rule_of("ACCEPT", "ALL", None, "::/0")
+    for shut in (rules_of([SSH_HOME]), rules_of([ssh6]), rules_of([all6])):  # IPv4 alone: shut, or with IPv6 open already
+        _, _, risk = fw.plan_add(shut, "inbound", ssh4, f, "db-fw")
+        assert risk == "the change opens SSH (22) to all of IPv4 (0.0.0.0/0) on db-fw (it guards db-1)", shut
+        _, _, risk = fw.plan_add(shut, "inbound", all4, f, "db-fw")
+        assert risk == ("the change opens every TCP port (SSH among them) and every UDP port to all of IPv4 (0.0.0.0/0) on "
+                        "db-fw (it guards db-1)"), shut
+    for shut in (rules_of([SSH_HOME]), rules_of([ssh4]), rules_of([all4])):  # IPv6 alone: shut, or with IPv4 open already
+        _, _, risk = fw.plan_add(shut, "inbound", ssh6, f, "db-fw")
+        assert risk == "the change opens SSH (22) to all of IPv6 (::/0) on db-fw (it guards db-1)", shut
+        _, _, risk = fw.plan_add(shut, "inbound", all6, f, "db-fw")
+        assert risk == ("the change opens every TCP port (SSH among them) and every UDP port to all of IPv6 (::/0) on "
+                        "db-fw (it guards db-1)"), shut
+    # a DROP for one family removed under a policy ACCEPT: that family opened, the other open already
+    for rule, family, whole in (("0.0.0.0/0", "IPv4", "0.0.0.0/0"), ("::/0", "IPv6", "::/0")):
+        drop = fw.rule_of("DROP", "TCP", "22", rule)
+        shut = rules_of([drop], inbound_policy="ACCEPT")
+        _, _, risk = fw.plan_remove(shut, "inbound", 1, f, "db-fw", fw.words(drop))
+        assert risk == f"the change opens every TCP port (SSH among them) to all of {family} ({whole}) on db-fw (it guards db-1)"
+    # both families opened by one change: the whole internet; a mix said family by family
+    mixed = fw.opened(rules_of([ssh6]), rules_of([ssh6, all4, fw.rule_of("ACCEPT", "TCP", "3389", "::/0")]))
+    assert fw.opened_words(mixed) == ("RDP (3389) to the whole internet; every TCP port (SSH among them) and every UDP "
+                                      "port to all of IPv4 (0.0.0.0/0)")
 
 
 def test_a_removal_names_its_rule_and_refuses_one_that_moved():

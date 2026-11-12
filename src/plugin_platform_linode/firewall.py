@@ -11,10 +11,10 @@ read, one rule added or removed, and everything written back:
   policies), or the change breaks the reference's limits (25 rules in all, 255 addresses a rule, 15 ports a rule);
 - a risky change is refused once and made only when accepted (ACCEPT_RISK, exactly true: the page's second
   confirmation), whatever rule it adds or removes: each change is weighed by the inbound policy and the rules left, before
-  and after it (risk_of). Risky: a change that lets the whole internet reach every TCP or UDP port, or SSH, RDP, Docker,
-  a database's or another port servers are broken into through (SENSITIVE), where it did not before (an ACCEPT added, or
-  a DROP removed); and one that ends SSH, from where the rules let it in, to a Linode the firewall guards (an ACCEPT
-  removed, or a DROP added).
+  and after it (risk_of), all of IPv4 and all of IPv6 each judged on its own (0.1.2: 0.1.1 merged them). Risky: a
+  change that lets either reach every TCP or UDP port, or SSH, RDP, Docker, a database's or another port servers are
+  broken into through (SENSITIVE), where it did not before (an ACCEPT added, or a DROP removed); and one that ends SSH,
+  from where the rules let it in, to a Linode the firewall guards (an ACCEPT removed, or a DROP added).
 
 Rules are applied in order, the first that matches deciding, else the direction's policy (ACCEPT or DROP). A rule:
 {action ACCEPT|DROP, protocol TCP|UDP|ICMP|IPENCAP|ALL, ports "22, 80, 443" or "1-65535" (TCP and UDP alone; none: every
@@ -38,6 +38,8 @@ MAX_ADDRESSES = 255  # a rule's, IPv4 and IPv6 together
 MAX_PIECES = 15  # a rule's ports, a range counting as two
 SSH = 22
 EVERYONE = (ipaddress.ip_network("0.0.0.0/0"), ipaddress.ip_network("::/0"))
+FAMILIES = ((EVERYONE[0], "IPv4"), (EVERYONE[1], "IPv6"))  # the whole internet, each family judged on its own
+WHOLE = {"IPv4": "0.0.0.0/0", "IPv6": "::/0"}
 ATTACHED_KINDS = frozenset({"linode", "linode_interface"})  # what SSH goes to (a NodeBalancer takes none)
 ACCEPT_RISK = "accept_risk"  # the hooks' argument accepting a risky change (the page's second confirmation)
 # the ports servers are broken into through when the whole internet reaches them (beside every port): a change newly
@@ -269,35 +271,54 @@ def stretches(rules: Sequence[Mapping], protocol: str) -> list[int]:
     return [a for a, b in zip(edges, edges[1:]) if a < b]
 
 
-def exposed(rules: Mapping) -> list[str]:
-    """What the whole internet (0.0.0.0/0, ::/0) reaches through the inbound rules and policy, in words: every TCP port,
-    every UDP port (each stretch of ports let in), and each of the ports servers are broken into through (SENSITIVE)."""
+def exposed(rules: Mapping) -> list[tuple[str, str]]:
+    """What the whole internet reaches through the inbound rules and policy, each family on its own (all of IPv4,
+    0.0.0.0/0; all of IPv6, ::/0): (what, family) for every TCP port, every UDP port (each stretch of ports let in), and
+    each of the ports servers are broken into through (SENSITIVE)."""
     inbound, policy = list(rules.get("inbound") or []), rules.get("inbound_policy")
-    found: dict[str, int] = {}
-    for probe in EVERYONE:
-        for i, proto in enumerate(("TCP", "UDP")):
+    out: list[tuple[str, str]] = []
+    for probe, family in FAMILIES:
+        for proto in ("TCP", "UDP"):
             if all(verdict(inbound, policy, probe, proto, port) == "ACCEPT" for port in stretches(inbound, proto)):
-                found[f"every {proto} port"] = i - 2
+                out.append((f"every {proto} port", family))
         for port, name in SENSITIVE.items():
             if verdict(inbound, policy, probe, "TCP", port) == "ACCEPT":
-                found[f"{name} ({port})"] = port
-    return sorted(found, key=lambda k: found[k])
+                out.append((f"{name} ({port})", family))
+    return out
 
 
-def opened(before: Mapping, after: Mapping) -> list[str]:
-    """What a change opens to the whole internet: what it reaches after and did not before."""
+def opened(before: Mapping, after: Mapping) -> list[tuple[str, str]]:
+    """What a change opens to the whole internet, family by family: what it reaches after and did not before (all of
+    IPv4 opened where all of IPv6 was open already is opened all the same)."""
     was = set(exposed(before))
     return [x for x in exposed(after) if x not in was]
 
 
-def opened_words(opens: Sequence[str]) -> str:
-    """What a change opens, in words: every TCP port standing for the TCP ports it holds (SSH named among them)."""
-    if "every TCP port" in opens:
-        parts = ["every TCP port" + (" (SSH among them)" if "SSH (22)" in opens else "")]
-        parts += [x for x in opens if x == "every UDP port"]
+def _listed(whats: Sequence[str]) -> str:
+    """Some ports in words: every TCP port standing for the TCP ports it holds (SSH named among them)."""
+    if "every TCP port" in whats:
+        parts = ["every TCP port" + (" (SSH among them)" if "SSH (22)" in whats else "")]
+        parts += [x for x in whats if x == "every UDP port"]
     else:
-        parts = list(opens)
+        parts = list(whats)
     return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def opened_words(opens: Sequence[tuple[str, str]]) -> str:
+    """What a change opens, in words, said by whom it opens it to: the whole internet (both families), all of IPv4
+    (0.0.0.0/0) or all of IPv6 (::/0)."""
+    families: dict[str, set[str]] = {}
+    for what, family in opens:
+        families.setdefault(what, set()).add(family)
+    groups: dict[frozenset, list[str]] = {}
+    for what, fams in families.items():
+        groups.setdefault(frozenset(fams), []).append(what)
+    parts = []
+    for fams in sorted(groups, key=lambda f: (-len(f), sorted(f))):  # the whole internet first, then IPv4, then IPv6
+        where = "the whole internet" if len(fams) == len(FAMILIES) else \
+            " and ".join(f"all of {f} ({WHOLE[f]})" for f in sorted(fams))
+        parts.append(f"{_listed(groups[fams])} to {where}")
+    return "; ".join(parts)
 
 
 def ssh_lost(before: Sequence[Mapping], after: Sequence[Mapping], policy: str, probes: Iterable) -> list[str]:
@@ -317,15 +338,14 @@ def ssh_probes(*rule_lists: Sequence[Mapping]) -> list:
 
 def risk_of(before: Mapping, after: Mapping, firewall: Mapping, label: str) -> str | None:
     """A change's risk in words (None: none), whatever rule it adds or removes: weighed by the inbound policy and the
-    rules left, before and after it. What it opens to the whole internet (every TCP or UDP port, SSH, RDP, a database's
-    or Docker's port: `exposed`), and the SSH it ends, from where the rules let it in, to a Linode the firewall guards
-    (you may lock yourself out)."""
+    rules left, before and after it. What it opens to all of IPv4 or all of IPv6, each family on its own (every TCP or
+    UDP port, SSH, RDP, a database's or Docker's port: `exposed`), and the SSH it ends, from where the rules let it in,
+    to a Linode the firewall guards (you may lock yourself out)."""
     bits = []
     guards = attached_linodes(firewall)
     opens = opened(before, after)
     if opens:
-        bits.append(f"the change opens {opened_words(opens)} to the whole internet on {label}"
-                    + (f" (it guards {', '.join(guards)})" if guards else ""))
+        bits.append(f"the change opens {opened_words(opens)} on {label}" + (f" (it guards {', '.join(guards)})" if guards else ""))
     if guards:
         b, a = list(before.get("inbound") or []), list(after.get("inbound") or [])
         lost = ssh_lost(b, a, before.get("inbound_policy"), ssh_probes(b, a))

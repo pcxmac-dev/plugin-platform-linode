@@ -90,7 +90,7 @@ def test_take_over_is_asked_twice_then_a_pass_sets_it_and_a_stale_one_is_refused
     with pytest.raises(ValueError, match="is not one of LINODE_DDNS_HOSTS"):
         p.ddns_take_over("www.example.com", accept_take_over=True)
     saved = json.loads(state_path().read_text(encoding="utf-8"))  # the take-over used up by its write: its own now
-    assert saved == {"own": {"home.example.com": HOME}, "taken": []}
+    assert saved == {"own": {"home.example.com": HOME}, "taken": {}}
 
 
 def test_the_take_overs_second_confirmation_counts_only_when_exactly_true(made, env):
@@ -164,7 +164,7 @@ def test_the_refresh_settles_too_and_a_fresh_start_lets_go_of_what_its_file_held
     assert again.keeper().own("home.example.com") == HOME  # its state file, as it was left
     again.refresh()  # the domains read, the whole setting known (empty): settled
     assert again.keeper().known() == []
-    assert json.loads(state_path().read_text(encoding="utf-8")) == {"own": {}, "taken": []}
+    assert json.loads(state_path().read_text(encoding="utf-8")) == {"own": {}, "taken": {}}
 
 
 def test_only_the_serving_platform_settles(made, env, monkeypatch):

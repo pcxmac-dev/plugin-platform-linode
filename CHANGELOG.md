@@ -8,6 +8,9 @@ settle there would empty the shared ddns.json); a take-over is single-use (used 
 then its own); the firewall's second confirmation names the family (all of IPv4, all of IPv6, or both), never "the
 whole internet" for one of them alone.
 
+Needs liminal-libs>=1.49.9: a take-over's consent is bound to the addresses it drops (a record changed after
+a failed write is asked about again); the state file keeps each take-over's addresses.
+
 ## 0.1.2 (2026-11-11)
 
 What the re-verification of the audit's fixes found (the other session re-checked 0.1.1). Needs liminal-libs>=1.49.7.

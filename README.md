@@ -141,9 +141,11 @@ an audit found 0.1.0 pointed a listed host's live record at home within a minute
   A host's AAAA records are not Dynamic DNS's: they are left as they are.
 
 Update DNS now (confirmed) sets each host of its own whether it differs or not. The address is asked again just before a
-write: a stale one is never written back. A host taken out of `LINODE_DDNS_HOSTS`, while the platform ran or not, is let
-go by the next refresh or pass once the account's domains are read (the keeper settled with the whole setting), so one
-listed again later is left as it is and offered Take over… again. The reference's `[remote_addr]` target is not used: the plugin sends the address it found, so the
+write: a stale one is never written back. A take-over is single-use: once its write lands, the host is Dynamic DNS's own,
+kept current by its own rule. A host taken out of `LINODE_DDNS_HOSTS`, while the platform ran or not, is let go by the
+serving platform's next refresh or pass once the account's domains are read (the keeper settled with the whole setting;
+never from the command line, whose shell may lack the setting), so one listed again later is left as it is and offered
+Take over… again. The reference's `[remote_addr]` target is not used: the plugin sends the address it found, so the
 record is this network's IPv4 address even when the request goes out over IPv6. A host in no master domain of the
 account (a slave's, another provider's) is named as such.
 

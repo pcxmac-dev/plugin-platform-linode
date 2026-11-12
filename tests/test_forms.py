@@ -46,6 +46,8 @@ def test_the_forms_name_the_hooks_arguments_in_order_and_the_change_in_their_con
         assert "nothing is written if they are not version 3 any more" in f["confirm"]["words"]
         (accept,) = [x for x in f["fields"] if x["type"] == "accept"]
         assert accept["name"] == ACCEPT_RISK and accept["yes"] == "Change it anyway" and "{firewall}" in accept["words"]
+        # the second confirmation names the family, as the refusal does: never "the whole internet" for one of them alone
+        assert "the family it names, all of IPv4 (0.0.0.0/0), all of IPv6 (::/0) or both (the whole internet)" in accept["words"]
         seen = next(x for x in f["fields"] if x["name"] == "seen")
         assert seen["type"] == "fixed" and seen["value"] == fake.firewalls[0]["rules"]["fingerprint"]
     assert next(x for x in forms["rule-add:9"]["fields"] if x["name"] == "ports")["when"] == {"protocol": ["TCP", "UDP"]}

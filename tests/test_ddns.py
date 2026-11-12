@@ -19,6 +19,15 @@ from plugin_platform_linode.refusal import Refusal
 HOME2 = "93.184.216.35"  # this network's address after it changed
 
 
+class ServingPlatform:
+    """A stand-in for the serving platform app (its NAME; `once`: one of its one-shot commands, status or machine)."""
+
+    NAME = "platform"
+
+    def __init__(self, once: bool = False):
+        self.once = once
+
+
 def a_records(fake, name: str) -> list[str]:
     return [r["target"] for r in fake.records[1] if r["type"] == "A" and r["name"] == name]
 
@@ -80,8 +89,8 @@ def test_take_over_is_asked_twice_then_a_pass_sets_it_and_a_stale_one_is_refused
     assert state["result"] == "set (was 198.51.100.7)" and a_records(fake, "home") == [HOME]
     with pytest.raises(ValueError, match="is not one of LINODE_DDNS_HOSTS"):
         p.ddns_take_over("www.example.com", accept_take_over=True)
-    saved = json.loads(state_path().read_text(encoding="utf-8"))
-    assert saved == {"own": {"home.example.com": HOME}, "taken": ["home.example.com"]}
+    saved = json.loads(state_path().read_text(encoding="utf-8"))  # the take-over used up by its write: its own now
+    assert saved == {"own": {"home.example.com": HOME}, "taken": []}
 
 
 def test_the_take_overs_second_confirmation_counts_only_when_exactly_true(made, env):
@@ -93,8 +102,8 @@ def test_the_take_overs_second_confirmation_counts_only_when_exactly_true(made, 
             p.ddns_take_over("home.example.com", "198.51.100.7", almost)
         assert not p.keeper().taken("home.example.com") and fake.writes() == []
     (state,) = p.ddns_take_over("home.example.com", "198.51.100.7", True)
-    assert p.keeper().taken("home.example.com") and state["result"] == "set (was 198.51.100.7)"
-    assert a_records(fake, "home") == [HOME]
+    assert state["result"] == "set (was 198.51.100.7)" and a_records(fake, "home") == [HOME]
+    assert p.keeper().own("home.example.com") == HOME and not p.keeper().taken("home.example.com")  # single-use
 
 
 def test_a_host_with_several_addresses_is_never_cut_to_one_unless_taken_over(made, env):
@@ -129,8 +138,9 @@ def test_a_host_taken_out_of_the_setting_is_let_go_and_put_back_is_left_as_it_is
     its row offering Take over… again)."""
     env(settings_of(ddns="home.example.com"))
     p, fake = made()
+    p.app = ServingPlatform()  # the serving platform's plugin alone settles (no background started here)
     p.ddns_take_over("home.example.com", "198.51.100.7", True)
-    assert p.keeper().taken("home.example.com") and a_records(fake, "home") == [HOME]
+    assert p.keeper().own("home.example.com") == HOME and a_records(fake, "home") == [HOME]
     monkeypatch.setenv("LINODE_DDNS_HOSTS", "lab.example.com")
     p.ddns_update(force=False)  # the next pass, with the whole setting
     assert not p.keeper().taken("home.example.com") and p.keeper().own("home.example.com") is None
@@ -150,10 +160,29 @@ def test_the_refresh_settles_too_and_a_fresh_start_lets_go_of_what_its_file_held
     p.ddns_take_over("home.example.com", "198.51.100.7", True)
     monkeypatch.delenv("LINODE_DDNS_HOSTS")  # every host taken out, while the plugin was not running
     again, _ = made(fake)
-    assert again.keeper().taken("home.example.com")  # its state file, as it was left
+    again.app = ServingPlatform()
+    assert again.keeper().own("home.example.com") == HOME  # its state file, as it was left
     again.refresh()  # the domains read, the whole setting known (empty): settled
     assert again.keeper().known() == []
     assert json.loads(state_path().read_text(encoding="utf-8")) == {"own": {}, "taken": []}
+
+
+def test_only_the_serving_platform_settles(made, env, monkeypatch):
+    """The third round: this plugin's own command line (or a one-shot command of the platform's) runs from a shell whose
+    setting may lack LINODE_DDNS_HOSTS; it must not settle, or it would empty the shared ddns.json."""
+    env(settings_of(ddns="lab.example.com"))
+    p, fake = made()
+    p.ddns_update(force=False)
+    assert p.keeper().own("lab.example.com") == HOME  # made: its own
+    monkeypatch.delenv("LINODE_DDNS_HOSTS")  # a shell without the setting
+    for app in (None, ServingPlatform(once=True), type("Charts", (), {"NAME": "charts"})()):
+        p.app = app  # unattached, a one-shot platform command, another app
+        p.refresh()
+        assert p.keeper().own("lab.example.com") == HOME, app  # kept
+        assert json.loads(state_path().read_text(encoding="utf-8"))["own"] == {"lab.example.com": HOME}
+    p.app = ServingPlatform()  # the serving platform: settles as before
+    p.refresh()
+    assert p.keeper().own("lab.example.com") is None and p.keeper().known() == []
 
 
 def test_a_cname_host_gets_no_a_record_beside_it(made, env):

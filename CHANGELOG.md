@@ -17,6 +17,11 @@ What the re-verification of the audit's fixes found (the other session re-checke
   with the whole LINODE_DDNS_HOSTS setting, even empty, in each refresh and each pass once the account's domains are
   read; put back later, a host holding another address is left as it is, its row offering Take over… again. (0.1.1's
   own let-go of removed hosts is replaced by it.)
+- The third round of checks (needs liminal-libs>=1.49.8): only the serving platform settles (not this plugin's own
+  command line, a one-shot platform command or another app: their shell's setting may lack LINODE_DDNS_HOSTS, and a
+  settle there would empty the shared ddns.json); a take-over is single-use (used up once its write lands, the host
+  then its own); the firewall's second confirmation names the family (all of IPv4, all of IPv6, or both), never "the
+  whole internet" for one of them alone.
 
 ## 0.1.1 (2026-11-11)
 

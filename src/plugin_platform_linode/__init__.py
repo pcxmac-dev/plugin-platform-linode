@@ -781,8 +781,11 @@ class LinodePlugin(MachinePlugin):
         """The keeper's hosts that are not in the whole Dynamic DNS setting let go (liminal-libs 1.49.7's settle), so one
         taken out of it, while the plugin ran or not, comes back as not its own: asked about again. Only once the
         account's domains are read (never on a list the unread zones would cut short), with the setting whole, even empty
-        (every host taken out)."""
-        if self._masters() is None:
+        (every host taken out); and only by the serving platform's plugin (the third round of checks: this plugin's own
+        command line runs from a shell whose setting may lack LINODE_DDNS_HOSTS, and its settle would empty the shared
+        ddns.json, forgetting every own record; a removal no settle saw is covered by the take-over being single-use,
+        liminal-libs 1.49.8)."""
+        if not self._on_platform() or self._masters() is None:
             return
         self.keeper().settle([typed_host(x) for x in cfg.hosts.replace(";", ",").replace(" ", ",").split(",") if x.strip()])
 
@@ -1403,7 +1406,8 @@ class LinodePlugin(MachinePlugin):
                 "choices": [{"value": print_, "title": f"version {version} (fingerprint {print_})"}]}
         accept = {"name": fw.ACCEPT_RISK, "type": "accept", "title": "Change the firewall anyway?", "yes": "Change it anyway",
                   "words": ("Changing it anyway writes exactly that to {firewall}: what the refusal names is opened to the "
-                            "whole internet, or SSH from there ends. It can be changed back here or in Cloud Manager.")}
+                            "family it names, all of IPv4 (0.0.0.0/0), all of IPv6 (::/0) or both (the whole internet), "
+                            "or the SSH it names ends. It can be changed back here or in Cloud Manager.")}
         attached = fw.attached_linodes(f)
         kept = (f"Every other rule and both policies are written back as read (Linode replaces the whole set): the rules are "
                 f"read again first, and nothing is written if they are not version {version} any more."

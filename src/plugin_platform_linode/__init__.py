@@ -50,7 +50,7 @@ from .ddns import PUBLIC_IPV4, LinodeDns, state_path
 from .refusal import Refusal
 from .settings import ACCESS_SHORT, DDNS_HOSTS, KEYS, NAMES, SCOPE_WORDS, TOKEN, TOKEN_PAGE, Config
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 REFRESH_S = 900.0  # the account read again at most this often while attached (or by Refresh)
 CONFIG_S = 30.0  # the settings asked of the login again after this long
 RETRY_S = 900.0  # a read that failed is taken as untried after this long while detached: attached again, it is tried again
@@ -231,6 +231,7 @@ class LinodePlugin(MachinePlugin):
     version = __version__
     order = 761
     ICON = "linode"  # Linode's prism (liminal-libs 1.49.0's icons.js)
+    SECTION = "cloud"  # drawn under the platform's Cloud plugins (liminal-libs 1.51.0, liminal-platform 0.25.0)
     HOOKS = (*MachinePlugin.HOOKS, "refresh", "linodes", "domains", "records", "firewalls", "ssh_keys", "power",
              "set_record", "remove_record", "add_rule", "remove_rule", "add_ssh_key", "remove_ssh_key", "ddns_update",
              "ddns_take_over")

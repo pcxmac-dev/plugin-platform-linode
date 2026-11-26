@@ -22,6 +22,13 @@ API card (card.py: plugin API 2.2).
 0.1.1 and 0.1.2 (2026-11-11) are what an audit of the cloud plugins and its re-verification found before any key went
 in: see CHANGELOG.md.
 
+Who may ask its changes (0.1.5; the independent review's PLT-H1 and the sweep of the plugins after it, 2026-11-25): a
+Linode's power, a record set or removed, a Cloud Firewall's rule added or removed, an SSH key added or removed, a Dynamic
+DNS pass and a host taken over are asked only from its page (PAGE_ONLY_HOOKS): another plugin's ask is refused, and the
+platform asks its login whether you are at the page. Before, any program on this PC could ask them of the platform with a
+header anyone can send, and the token did the rest; a second confirmation is an argument the asker sets. Its reads are
+asked by anyone. The background and the command line call the same code themselves: those are not asks.
+
     python -m plugin_platform_linode status | servers | domains | records DOMAIN | ddns [--now] | firewalls | keys
         | power LINODE on|off|reboot | set DOMAIN HOST TYPE TARGET [--ttl N] [--priority N] [--tag T]
         | remove DOMAIN HOST TYPE [TARGET]
@@ -50,7 +57,7 @@ from .ddns import PUBLIC_IPV4, LinodeDns, state_path
 from .refusal import Refusal
 from .settings import ACCESS_SHORT, DDNS_HOSTS, KEYS, NAMES, SCOPE_WORDS, TOKEN, TOKEN_PAGE, Config
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 REFRESH_S = 900.0  # the account read again at most this often while attached (or by Refresh)
 CONFIG_S = 30.0  # the settings asked of the login again after this long
 RETRY_S = 900.0  # a read that failed is taken as untried after this long while detached: attached again, it is tried again
@@ -235,6 +242,15 @@ class LinodePlugin(MachinePlugin):
     HOOKS = (*MachinePlugin.HOOKS, "refresh", "linodes", "domains", "records", "firewalls", "ssh_keys", "power",
              "set_record", "remove_record", "add_rule", "remove_rule", "add_ssh_key", "remove_ssh_key", "ddns_update",
              "ddns_take_over")
+    # Its changes, asked only from its page (0.1.5, the sweep after the review's PLT-H1; liminal-libs 1.66.0's
+    # apps/asking.py): another plugin's ask is refused (403), and liminal-platform 0.34.0 refuses one over HTTP (401) unless
+    # its login shows that you are at the page. Before, any program on this PC could ask them of the platform with a header
+    # anyone can send, the page's dialogs being the only confirmation (a second one, accept_risk or accept_take_over, is an
+    # argument the asker sets): a Linode shut down, a record set or removed, a firewall opened, with your token. The
+    # background's reads and Dynamic DNS passes and the command line call the code directly, not through an ask; its reads
+    # (refresh and the lists among them) are asked by anyone.
+    PAGE_ONLY_HOOKS = ("power", "set_record", "remove_record", "add_rule", "remove_rule", "add_ssh_key", "remove_ssh_key",
+                       "ddns_update", "ddns_take_over")
     keys = KEYS
     signup = TOKEN_PAGE
     limits = ("Linode's API: 200 list requests a minute and 1,600 others; the plugin makes about 20 a quarter of an hour "

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "plugin-platform-linode"
-version = "0.1.4"  # the plugin's own release (CHANGELOG.md); the platform shows it on the plugin's page
+version = "0.1.5"  # the plugin's own release (CHANGELOG.md); the platform shows it on the plugin's page
 description = "Linode (Akamai Cloud) for Liminal's platform: the account read through Linode's API v4 (Linodes with their prices, DNS Manager, Cloud Firewalls, volumes, SSH keys), free changes only, each confirmed, and Dynamic DNS."
 readme = "README.md"
 requires-python = ">=3.10"

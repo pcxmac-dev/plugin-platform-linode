@@ -197,6 +197,15 @@ A change's report:
 host, type and target to remove it, the rules' fingerprint (`seen`) to change them and a rule's words to remove it, a
 key's label (`""` for none) to remove it; `accept_risk` and `accept_take_over` count only when exactly `true`.
 
+**The changes are asked only from the plugin's page** (`PAGE_ONLY_HOOKS`, 0.1.5): `power`, `set_record`,
+`remove_record`, `add_rule`, `remove_rule`, `add_ssh_key`, `remove_ssh_key`, `ddns_update` and `ddns_take_over`.
+Another plugin's ask of one is refused, and over HTTP the platform refuses one unless its login shows that you are at
+the page (liminal-libs 1.66.0 and liminal-platform 0.34.0 read the word; what is older than those asks them as before).
+`present`, `status`, `refresh()` and the reads are asked by anyone. The plugin's own background (its reads, its Dynamic
+DNS passes) and its command line call the code themselves: they are not asks. The platform's check rests on its
+login's word that your browser is signed in, and a local login signs `secret` and `default` in with no password: it
+does not stop a program on this PC that signs itself in.
+
 ## From the command line
 
 Its settings read from the environment (as this shell has them). The reads ask nothing; each change says what it does

@@ -25,7 +25,7 @@ def test_every_plugin_here_conforms_to_the_class_contract():
     assert [p.name for p in found] == ["linode"] and all(p.api == "2.2" and not p.is_record for p in found)
     assert {p.SYSTEM for p in found} == {"platform"} and {p.KIND for p in found} == {"machine"}
     (p,) = found
-    assert (p.title, p.order, p.ICON, p.version, module.__version__) == ("Linode", 761, "linode", "0.1.5", "0.1.5")
+    assert (p.title, p.order, p.ICON, p.version, module.__version__) == ("Linode", 761, "linode", "0.1.6", "0.1.6")
     assert [a.name for a in p.apis] == ["Linode API v4"] and p.interface()["apis"] == ["Linode API v4"]
 
 

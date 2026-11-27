@@ -5,7 +5,8 @@ an SSH key added or removed, a Dynamic DNS pass and a host taken over. Another p
 that names no one; over HTTP the platform also asks its login whether you are at the page. Before, any program on this PC
 asked them of the platform with a header anyone can send, and the token did the rest: the web Linode shut down, the
 domain's address set to another, PostgreSQL opened to the whole internet and the rule letting SSH in removed (their
-second confirmation being only an argument), an SSH key added to the profile. Its reads are asked by anyone, as before.
+second confirmation being only an argument), an SSH key added to the profile. Its reads are asked only from its page too since 0.1.6 (closed by default: the account's key makes them; `present` and
+`status` alone are anyone's).
 Asked through the library's own App (its ask names who asks as the platform's does), over the stand-in Linode: nothing
 reaches Linode or the network."""
 from __future__ import annotations
@@ -24,6 +25,11 @@ from plugin_platform_linode import firewall as fw  # noqa: E402
 CHANGES = ("power", "set_record", "remove_record", "add_rule", "remove_rule", "add_ssh_key", "remove_ssh_key",
            "ddns_update", "ddns_take_over")
 READS = ("present", "status", "refresh", "linodes", "domains", "records", "firewalls", "ssh_keys")
+# 0.1.6, closed by default (the user, 2026-11-26: "Page-only"): the reads made with the account's key are its
+# page's alone too; the contract's own two stay anyone's
+OPEN_READS = ("present", "status")
+PAGE_READS = tuple(h for h in READS if h not in OPEN_READS)
+READ_ARGS = {'records': ('example.com',)}  # the argument a read takes, as another program words it
 HOSTS = "new.example.com,home.example.com"  # Dynamic DNS's: one with no record yet, one holding another address
 WEB_SEEN, DB_SEEN = (f["rules"]["fingerprint"] for f in FakeLinode().firewalls)  # each firewall's rules as any read shows
 ASKED = {  # each change as another program worded it: the hook's arguments, a second confirmation said where it has one
@@ -89,17 +95,17 @@ def attached(made):
     app.detach(plugin.name)
 
 
-def test_its_changes_are_said_to_be_asked_only_from_its_page_and_its_reads_by_anyone():
-    assert set(internal.page_only(MACHINE)) == set(CHANGES)  # what the platform reads
+def test_its_changes_are_said_to_be_asked_only_from_its_page_and_its_reads_with_the_key_too():
+    assert set(internal.page_only(MACHINE)) == {*CHANGES, *PAGE_READS}  # what the platform reads
     assert internal.plugin_only(MACHINE) == ()
     assert internal.problems(MACHINE) == []  # each a hook of its own, and someone may ask it
     assert set(CHANGES) | set(READS) == set(MACHINE.interface()["hooks"]) and set(ASKED) == set(CHANGES)
-    for hook in CHANGES:
+    for hook in (*CHANGES, *PAGE_READS):
         assert asking.refusal(MACHINE, hook, asking.PAGE) == ""
         assert asking.refusal(MACHINE, hook, "neighbour") == (f"linode's {hook} is asked only from its page, "
                                                               "never by another plugin: neighbour asked it.")
         assert asking.refusal(MACHINE, hook, None).endswith("This ask names no asker: neither the page nor a plugin.")
-    for hook in READS:
+    for hook in OPEN_READS:
         assert {asking.refusal(MACHINE, hook, who) for who in (asking.PAGE, "neighbour", None)} == {""}
 
 
@@ -109,10 +115,14 @@ def test_another_plugin_or_no_one_asking_a_change_sends_nothing_and_its_page_doe
         for ask in (neighbour.wants, app.on_its_own):
             with pytest.raises(asking.AskRefused, match=f"linode's {hook} is asked only from its page"):
                 ask(hook, *ASKED[hook])
+    for hook in PAGE_READS:  # 0.1.6: a read made with the key is refused them too, and nothing is sent for it
+        for ask in (neighbour.wants, app.on_its_own):
+            with pytest.raises(asking.AskRefused, match=f"linode's {hook} is asked only from its page"):
+                ask(hook, *READ_ARGS.get(hook, ()))
     assert fake.requests == []  # nothing sent, nor read: not the read a change makes first
-    assert neighbour.wants("present") is True and neighbour.wants("status")["valid"] is True  # its reads, as before
-    assert [x["label"] for x in neighbour.wants("linodes")] == ["web-1", "db-1"]
-    assert len(neighbour.wants("records", "example.com")) == 5 and app.on_its_own("refresh")["linodes"] == 2
+    assert neighbour.wants("present") is True and neighbour.wants("status")["valid"] is True  # the contract's reads, anyone's as before
+    assert [x["label"] for x in app.from_page("linodes")] == ["web-1", "db-1"]
+    assert len(app.from_page("records", "example.com")) == 5 and app.from_page("refresh")["linodes"] == 2
     assert fake.writes() == []
     for hook in CHANGES:  # the same asks from its page: each one sent
         sent = len(fake.writes())
@@ -130,3 +140,18 @@ def test_its_own_code_asks_nothing_of_the_app_and_runs_as_before(attached):
     new, home = plugin.ddns_update(force=False)
     assert new["result"] == "made (was none)" and home["foreign"] is True
     assert [w[:2] for w in fake.writes()] == [("POST", "/v4/domains/1/records")]
+
+
+def test_no_hook_is_left_undeclared():
+    """0.1.6, closed by default (liminal-libs 1.107.0): every hook it answers says who may ask it, so none is left to
+    the default and the library's conformance has no warning. Read from its words, so it holds on an older library."""
+    from liminal_libs.sources import conformance
+
+    said = {h for word in ("READ_HOOKS", "SERVICE_HOOKS", "PLUGIN_ONLY_HOOKS", "PAGE_ONLY_HOOKS")
+            for h in internal.declared(MACHINE, word)}
+    own = [h for h in MACHINE.interface()["hooks"] if h not in ("setup", "run", "scan")]
+    assert own and [h for h in own if h not in said] == []
+    assert set(PAGE_READS) <= set(internal.declared(MACHINE, "PAGE_ONLY_HOOKS"))
+    assert not set(PAGE_READS) & set(internal.declared(MACHINE, "READ_HOOKS"))  # none is opened again as a read
+    warnings = getattr(conformance, "warnings", None)  # liminal-libs 1.107.0
+    assert warnings is None or warnings(MACHINE) == []
